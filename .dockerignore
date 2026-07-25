@@ -1,0 +1,54 @@
+# Repo-level dockerignore. This applies when building from the repo root.
+
+# VCS
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+**/.venv/
+backend/.venv/
+backend/.venv.bak.*/
+venv/
+pip-wheel-metadata/
+
+# Build artifacts
+build/
+dist/
+frontend/dist/
+.vite/
+frontend/.vite/
+
+# Environment files and logs
+.env
+.env.*
+*.log
+npm-debug.log
+yarn-error.log
+
+# Node
+**/node_modules
+
+# Docker / compose local overrides
+docker-compose.override.yml
+docker-compose.*.yml
+
+# Project artifacts
+tmp_pdf/
+user_files/
+uploads/
+data/video_runs/
+models/**
+backend/.venv.bak.*/
+*.sqlite3
+*.db
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

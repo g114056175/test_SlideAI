@@ -1,0 +1,83 @@
+name: slideai
+
+x-logging: &default-logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    gpus: all
+    restart: unless-stopped
+    logging: *default-logging
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      DATABASE_URL: sqlite:////app/data/database/slideai.sqlite3
+      SLIDEAI_VIDEO_RUNS_DIR: /app/data/video_runs
+      FRONTEND_URL: http://localhost:${FRONTEND_PORT:-5174}
+      VIDEO_ABSTRACT_LOCAL_ONLY: ${VIDEO_ABSTRACT_LOCAL_ONLY:-true}
+      SLIDEAI_MODELS_DIR: /models
+      SLIDEAI_TTS_PROVIDER: ${SLIDEAI_TTS_PROVIDER:-voxcpm_nano}
+      SLIDEAI_ASR_PROVIDER: ${SLIDEAI_ASR_PROVIDER:-qwen3}
+      SLIDEAI_ALIGNMENT_PROVIDER: ${SLIDEAI_ALIGNMENT_PROVIDER:-qwen3}
+      VOXTTS_MODEL_PATH: /models/tts/VoxCPM2
+      QWEN3_TTS_MODEL_PATH: /models/tts/Qwen3-TTS-12Hz-1.7B-Base
+      QWEN3_ASR_MODEL_PATH: /models/asr/Qwen3-ASR-1.7B
+      QWEN3_ALIGNER_MODEL_PATH: /models/alignment/Qwen3-ForcedAligner-0.6B
+      VOXTTS_ENGINE: nano_vllm
+      VOXTTS_NANO_WORKER_PATH: /app/backend/app/workers/nano_voxcpm_worker.py
+      VOXTTS_RUNTIME_PYTHON: /opt/slideai/voxcpm-nano/bin/python
+      QWEN3_TTS_RUNTIME_PYTHON: /opt/slideai/qwen-speech/bin/python
+      QWEN3_ASR_RUNTIME_PYTHON: /opt/slideai/qwen-speech/bin/python
+      VOXTTS_NANO_TIMESTEPS: ${VOXTTS_NANO_TIMESTEPS:-12}
+      VOXTTS_NANO_GPU_MEMORY_UTILIZATION: ${VOXTTS_NANO_GPU_MEMORY_UTILIZATION:-0.50}
+      VOXTTS_NANO_IDLE_TIMEOUT_SEC: ${VOXTTS_NANO_IDLE_TIMEOUT_SEC:-120}
+      QWEN3_ALIGNMENT_IDLE_TIMEOUT_SEC: ${QWEN3_ALIGNMENT_IDLE_TIMEOUT_SEC:-60}
+    volumes:
+      - ./data:/app/data
+      - ${VOXTTS_MODEL_HOST_PATH:-./models/tts/VoxCPM2}:/models/tts/VoxCPM2:ro
+      - ${QWEN3_ASR_MODEL_HOST_PATH:-./models/asr/Qwen3-ASR-1.7B}:/models/asr/Qwen3-ASR-1.7B:ro
+      - ${QWEN3_ALIGNER_MODEL_HOST_PATH:-./models/alignment/Qwen3-ForcedAligner-0.6B}:/models/alignment/Qwen3-ForcedAligner-0.6B:ro
+      - ${QWEN3_TTS_MODEL_HOST_PATH:-./models/tts/Qwen3-TTS-12Hz-1.7B-Base}:/models/tts/Qwen3-TTS-12Hz-1.7B-Base:ro
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8002}:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/docs')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-5174}:80"
+
+  postgres:
+    image: postgres:16
+    profiles: ["postgres"]
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-slideai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-slideai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
