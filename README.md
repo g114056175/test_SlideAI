@@ -103,6 +103,8 @@ chmod +x slideai.sh
 
 目前內部版的主要工作流不需要註冊或登入；`/login`、`/register` 與舊管理
 頁面是保留的相容路由，不是使用 `/video-abstract-lab` 的必要步驟。
+瀏覽器的 API 請求使用同源 `/api`，由前端服務代理至 FastAPI；使用者端
+不需要能直接連線後端 port，也不會把特定主機 IP 寫死在前端 bundle。
 
 自動化環境仍可明確指定命令：
 

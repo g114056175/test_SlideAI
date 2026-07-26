@@ -56,7 +56,8 @@ done
 
 curl -fsS "${FRONTEND_BASE}/video-abstract-lab" >/dev/null \
   || fail "lab frontend unavailable: ${FRONTEND_BASE}/video-abstract-lab"
-curl -fsS "${API_BASE}/" | jq -e '.status == "running"' >/dev/null || fail "backend health failed"
+curl -fsS "${API_BASE}/api/health" | jq -e '.status == "healthy"' >/dev/null \
+  || fail "backend health failed"
 curl -fsS "${API_BASE}/api/video-runs" | jq -e '.runs | type == "array"' >/dev/null \
   || fail "video-run history failed"
 curl -fsS "${API_BASE}/api/llm/status" | jq -e 'has("configured") and has("provider")' >/dev/null \
@@ -68,7 +69,8 @@ cors_code="$(
     -H 'Access-Control-Request-Method: POST' \
     "${API_BASE}/api/video-abstract"
 )"
-[[ "${cors_code}" == "200" ]] || fail "private-LAN CORS failed (${cors_code})"
+[[ "${cors_code}" == "200" || "${cors_code}" == "204" ]] \
+  || fail "private-LAN CORS failed (${cors_code})"
 say "PASS: frontend, backend, project history, LLM status and CORS"
 
 if [[ -z "${PDF_PATH}" ]]; then

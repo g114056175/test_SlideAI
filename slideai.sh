@@ -362,9 +362,8 @@ start_app_only() {
   prepare_app_only
   local backend_port="${BACKEND_PORT:-8002}"
   local frontend_port="${FRONTEND_PORT:-5174}"
-  local lan_ip api_url
+  local lan_ip
   lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  api_url="${SLIDEAI_APP_API_URL:-http://${lan_ip:-127.0.0.1}:${backend_port}}"
 
   if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
     && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
@@ -389,8 +388,9 @@ start_app_only() {
   )
   (
     cd "${PROJECT_ROOT}/frontend"
-    VITE_API_BASE_URL="${api_url}" npm run build >/dev/null
-    nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
+    VITE_API_BASE_URL="/api" npm run build >/dev/null
+    VITE_API_PROXY_TARGET="http://127.0.0.1:${backend_port}" \
+      nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
       >/dev/null 2>&1 < /dev/null &
   )
 
@@ -484,8 +484,9 @@ start_native() {
   )
   (
     cd "${PROJECT_ROOT}/frontend"
-    VITE_API_BASE_URL="http://${lan_ip:-127.0.0.1}:${backend_port}" npm run build >/dev/null
-    nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
+    VITE_API_BASE_URL="/api" npm run build >/dev/null
+    VITE_API_PROXY_TARGET="http://127.0.0.1:${backend_port}" \
+      nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
       >/dev/null 2>&1 < /dev/null &
   )
   local i

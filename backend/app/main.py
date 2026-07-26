@@ -439,6 +439,7 @@ def root():
     }
 
 @app.get('/health')
+@app.get('/api/health')
 def health_check():
     """健康檢查端點 - 包含記憶體使用情況"""
     try:

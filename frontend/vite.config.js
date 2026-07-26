@@ -1,7 +1,15 @@
 import { defineConfig } from "vite";
 import vue from "@vitejs/plugin-vue";
 
-const devApiTarget = process.env.VITE_API_BASE_URL || process.env.VITE_API_URL || process.env.MOCK_API_URL;
+const configuredApiBase = process.env.VITE_API_BASE_URL || process.env.VITE_API_URL || process.env.MOCK_API_URL;
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET
+  || (/^https?:\/\//i.test(configuredApiBase || "") ? configuredApiBase : "");
+const apiProxy = apiProxyTarget ? {
+  "/api": {
+    target: apiProxyTarget,
+    changeOrigin: true,
+  },
+} : undefined;
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -30,12 +38,7 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     port: 5174,      // Lab 測試預設 5174
-    proxy: devApiTarget ? {
-      "/api": {
-        target: devApiTarget,
-        changeOrigin: true,
-      },
-    } : undefined,
+    proxy: apiProxy,
   },
 
   // 修改 2: 新增 "preview" 區塊 (關鍵！這是給 Zeabur Docker 部署用的)
@@ -49,6 +52,9 @@ export default defineConfig({
     // 修改 3: 解決 "Blocked request" 錯誤
     // 設為 true 代表允許任何網域連線 (包含 slideai-frontend.zeabur.app)
     allowedHosts: true,
+    // Native/app-only deployment uses same-origin /api in the browser. Vite
+    // forwards it to FastAPI so clients never need direct access to port 8002.
+    proxy: apiProxy,
   },
 
   optimizeDeps: {
