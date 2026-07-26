@@ -35,6 +35,7 @@ SlideAI Ubuntu 管理工具
   ./slideai.sh logs     追蹤服務紀錄
   ./slideai.sh setup    只進行環境與模型設定
   ./slideai.sh check    唯讀檢查，不安裝或下載
+  ./slideai.sh app-only 只建置並啟動基本前後端，不需要模型或 Docker
 
 不帶參數時會顯示數字選單。
 EOF
@@ -56,10 +57,11 @@ SlideAI 管理選單
   6) 環境檢查
   7) 部署設定
   8) 查看日誌
+  9) 基本前後端（跳過模型與 Docker）
   0) 離開
 EOF
   local choice
-  read -r -p "請輸入選項 [0-8]：" choice
+  read -r -p "請輸入選項 [0-9]：" choice
   case "${choice}" in
     1) printf 'start' ;;
     2) printf 'build' ;;
@@ -69,6 +71,7 @@ EOF
     6) printf 'check' ;;
     7) printf 'setup' ;;
     8) printf 'logs' ;;
+    9) printf 'app-only' ;;
     0) printf 'exit' ;;
     *) fail "無效選項：${choice}" ;;
   esac
@@ -332,13 +335,77 @@ check_native_runtimes() {
   say "[OK] 既有 Nano／Qwen speech runtimes"
 }
 
-stop_legacy_native() {
-  # One-time migration cleanup for processes started by the removed native
-  # launchers. Future deployments are managed exclusively by Docker Compose.
-  pkill -f '(^|/)backend/\.venv/bin/python -m uvicorn backend\.app\.main:app .*--port 8002$' 2>/dev/null || true
-  pkill -f '^node spa-server\.cjs$' 2>/dev/null || true
-  pkill -f '^npm run preview --host 0\.0\.0\.0 --port 5174$' 2>/dev/null || true
-  pkill -f 'node .*/vite\.js preview .*--port 5174' 2>/dev/null || true
+stop_project_native() {
+  local backend_port="${BACKEND_PORT:-8002}"
+  local frontend_port="${FRONTEND_PORT:-5174}"
+  pkill -f "${PROJECT_ROOT}/backend/\\.venv/bin/python -m uvicorn backend\\.app\\.main:app .*--port ${backend_port}" 2>/dev/null || true
+  pkill -f "${PROJECT_ROOT}/frontend/node_modules/.bin/vite preview .*--port ${frontend_port}" 2>/dev/null || true
+}
+
+prepare_app_only() {
+  command -v python3 >/dev/null 2>&1 || fail "基本前後端模式需要 Python 3。"
+  command -v npm >/dev/null 2>&1 || fail "基本前後端模式需要 Node.js/npm。"
+  if [[ ! -x "${PROJECT_ROOT}/backend/.venv/bin/python" ]]; then
+    say "建立精簡 backend 環境……"
+    python3 -m venv "${PROJECT_ROOT}/backend/.venv"
+    "${PROJECT_ROOT}/backend/.venv/bin/pip" install --quiet --disable-pip-version-check \
+      -r "${PROJECT_ROOT}/backend/requirements.txt"
+  fi
+  if [[ ! -d "${PROJECT_ROOT}/frontend/node_modules" ]]; then
+    say "安裝 frontend 依賴……"
+    npm --prefix "${PROJECT_ROOT}/frontend" ci --no-audit --no-fund --loglevel=error
+  fi
+}
+
+start_app_only() {
+  ensure_app_config
+  prepare_app_only
+  local backend_port="${BACKEND_PORT:-8002}"
+  local frontend_port="${FRONTEND_PORT:-5174}"
+  local lan_ip api_url
+  lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  api_url="${SLIDEAI_APP_API_URL:-http://${lan_ip:-127.0.0.1}:${backend_port}}"
+
+  if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
+    && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
+    say "基本前後端已在運作：http://127.0.0.1:${frontend_port}"
+    return
+  fi
+
+  stop_project_native
+  (
+    set -a
+    # shellcheck disable=SC1090
+    source "${BACKEND_ENV}"
+    set +a
+    export VIDEO_ABSTRACT_LOCAL_ONLY=true
+    export VIDEO_ABSTRACT_MOCK_MODE=true
+    export FRONTEND_URL="http://127.0.0.1:${frontend_port},http://localhost:${frontend_port}"
+    [[ -n "${lan_ip}" ]] && export FRONTEND_URL="${FRONTEND_URL},http://${lan_ip}:${frontend_port}"
+    export SLIDEAI_VIDEO_RUNS_DIR="${PROJECT_ROOT}/data/video_runs"
+    nohup setsid "${PROJECT_ROOT}/backend/.venv/bin/python" -m uvicorn \
+      backend.app.main:app --host 0.0.0.0 --port "${backend_port}" --no-access-log \
+      >/dev/null 2>&1 < /dev/null &
+  )
+  (
+    cd "${PROJECT_ROOT}/frontend"
+    VITE_API_BASE_URL="${api_url}" npm run build >/dev/null
+    nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
+      >/dev/null 2>&1 < /dev/null &
+  )
+
+  local i
+  for i in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
+      && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
+      say "基本前後端已啟動：http://127.0.0.1:${frontend_port}"
+      say "此模式不載入 TTS／ASR／強制對齊模型。"
+      return
+    fi
+    sleep 1
+  done
+  stop_project_native
+  fail "基本前後端未能在預期時間內啟動。"
 }
 
 start_app() {
@@ -357,7 +424,7 @@ start_app() {
     say "首次啟動：先完成 Docker 映像建置，現有服務會保持運作。"
     compose_cmd build
   fi
-  stop_legacy_native
+  stop_project_native
   compose_cmd up -d --no-build
   say "等待服務健康檢查……"
   local i
@@ -373,15 +440,17 @@ start_app() {
 }
 
 start_native() {
+  local backend_port="${BACKEND_PORT:-8002}"
+  local frontend_port="${FRONTEND_PORT:-5174}"
   check_native_runtimes
   command -v npm >/dev/null 2>&1 || fail "Native 模式需要 Node.js/npm。"
   [[ -x "${PROJECT_ROOT}/backend/.venv/bin/python" ]] || fail "缺少 backend/.venv。"
-  if curl -fsS http://127.0.0.1:8002/docs >/dev/null 2>&1 \
-    && curl -fsS http://127.0.0.1:5174/ >/dev/null 2>&1; then
-    say "SlideAI 已在 native 模式運作：http://127.0.0.1:5174"
+  if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
+    && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
+    say "SlideAI 已在 native 模式運作：http://127.0.0.1:${frontend_port}"
     return
   fi
-  stop_legacy_native
+  stop_project_native
   (
     set -a
     # shellcheck disable=SC1090
@@ -407,23 +476,23 @@ start_native() {
     export SLIDEAI_VIDEO_RUNS_DIR="${PROJECT_ROOT}/data/video_runs"
     local lan_ip
     lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    export FRONTEND_URL="http://127.0.0.1:5174,http://localhost:5174"
-    [[ -n "${lan_ip}" ]] && export FRONTEND_URL="${FRONTEND_URL},http://${lan_ip}:5174"
+    export FRONTEND_URL="http://127.0.0.1:${frontend_port},http://localhost:${frontend_port}"
+    [[ -n "${lan_ip}" ]] && export FRONTEND_URL="${FRONTEND_URL},http://${lan_ip}:${frontend_port}"
     nohup setsid "${PROJECT_ROOT}/backend/.venv/bin/python" -m uvicorn \
-      backend.app.main:app --host 0.0.0.0 --port 8002 \
+      backend.app.main:app --host 0.0.0.0 --port "${backend_port}" \
       >/dev/null 2>&1 < /dev/null &
   )
   (
     cd "${PROJECT_ROOT}/frontend"
-    npm run build >/dev/null
-    nohup setsid npm run preview -- --host 0.0.0.0 --port 5174 \
+    VITE_API_BASE_URL="http://${lan_ip:-127.0.0.1}:${backend_port}" npm run build >/dev/null
+    nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
       >/dev/null 2>&1 < /dev/null &
   )
   local i
   for i in $(seq 1 45); do
-    if curl -fsS http://127.0.0.1:8002/docs >/dev/null 2>&1 \
-      && curl -fsS http://127.0.0.1:5174/ >/dev/null 2>&1; then
-      say "SlideAI 已以既有本機環境啟動：http://127.0.0.1:5174"
+    if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
+      && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
+      say "SlideAI 已以既有本機環境啟動：http://127.0.0.1:${frontend_port}"
       return
     fi
     sleep 1
@@ -433,7 +502,7 @@ start_native() {
 
 stop_app() {
   load_model_config 1
-  stop_legacy_native
+  stop_project_native
   if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
     say "SlideAI 已停止。"
     return
@@ -513,6 +582,7 @@ command_name="${1:-}"
 [[ -n "${command_name}" ]] || command_name="$(choose_command)"
 case "${command_name}" in
   start) start_app ;;
+  app-only) start_app_only ;;
   build) preflight; prepare_models || fail "仍缺少必要模型。"; compose_cmd build ;;
   stop) stop_app ;;
   restart) stop_app; start_app ;;

@@ -76,6 +76,7 @@ chmod +x slideai.sh
 6) 環境檢查
 7) 部署設定
 8) 查看日誌
+9) 基本前後端（跳過模型與 Docker）
 0) 離開
 ```
 
@@ -110,6 +111,20 @@ chmod +x slideai.sh
 ./slideai.sh status
 ./slideai.sh logs
 ./slideai.sh check
+```
+
+若只想在乾淨環境確認 WebUI 與 FastAPI，不下載模型也不建置 Docker：
+
+```bash
+./slideai.sh app-only
+```
+
+此模式會建立精簡 `backend/.venv`、執行 `npm ci` 並啟動前後端，但不提供
+TTS、ASR 或強制對齊推論。可使用 `BACKEND_PORT`、`FRONTEND_PORT` 避免與
+既有服務衝突：
+
+```bash
+BACKEND_PORT=8102 FRONTEND_PORT=5274 ./slideai.sh app-only
 ```
 
 ## 模型
