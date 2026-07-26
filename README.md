@@ -101,6 +101,12 @@ chmod +x slideai.sh
 - Backend API：`http://localhost:8002`
 - OpenAPI 文件：`http://localhost:8002/docs`
 
+`5174/8002` 是預設起始 port。啟動時若其中一個已被占用，腳本會從該數字
+開始向後尋找可用的四位數 port，例如 `5175/8003`，並讓前端代理自動連到
+實際後端。最後選用的本機及區網網址會印在終端，亦會暫存在
+`runtime/ports.env`，供 `status`、`stop`、`restart` 與 smoke test 使用；
+該狀態檔不會提交至 Git。
+
 目前內部版的主要工作流不需要註冊或登入；`/login`、`/register` 與舊管理
 頁面是保留的相容路由，不是使用 `/video-abstract-lab` 的必要步驟。
 瀏覽器的 API 請求使用同源 `/api`，由前端服務代理至 FastAPI；使用者端
@@ -126,8 +132,8 @@ chmod +x slideai.sh
 
 此模式會建立精簡 `backend/.venv`、執行 `npm ci` 並啟動前後端，但不提供
 LLM 講稿、TTS、ASR 或強制對齊推論。PDF 上傳、逐頁預覽、專案保存與前後
-端跳轉仍可測試；模型相關步驟會明確略過。可使用 `BACKEND_PORT`、
-`FRONTEND_PORT` 避免與既有服務衝突：
+端跳轉仍可測試；模型相關步驟會明確略過。可用 `BACKEND_PORT`、
+`FRONTEND_PORT` 指定搜尋起點：
 
 ```bash
 BACKEND_PORT=8102 FRONTEND_PORT=5274 ./slideai.sh app-only

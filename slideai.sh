@@ -7,6 +7,8 @@ MODEL_CONFIG="${PROJECT_ROOT}/deploy/models.env"
 MODEL_CONFIG_EXAMPLE="${PROJECT_ROOT}/deploy/models.env.example"
 BACKEND_ENV="${PROJECT_ROOT}/backend/.env"
 BACKEND_ENV_EXAMPLE="${PROJECT_ROOT}/backend/.env.example"
+RUNTIME_DIR="${PROJECT_ROOT}/runtime"
+PORT_STATE="${RUNTIME_DIR}/ports.env"
 NONINTERACTIVE="${SLIDEAI_NONINTERACTIVE:-0}"
 DOCKER=(docker)
 
@@ -335,11 +337,122 @@ check_native_runtimes() {
   say "[OK] 既有 Nano／Qwen speech runtimes"
 }
 
+read_port_state() {
+  ACTIVE_FRONTEND_PORT=""
+  ACTIVE_BACKEND_PORT=""
+  ACTIVE_DEPLOY_MODE=""
+  [[ -f "${PORT_STATE}" ]] || return 1
+  local key value
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      FRONTEND_PORT) [[ "${value}" =~ ^[0-9]{4,5}$ ]] && ACTIVE_FRONTEND_PORT="${value}" ;;
+      BACKEND_PORT) [[ "${value}" =~ ^[0-9]{4,5}$ ]] && ACTIVE_BACKEND_PORT="${value}" ;;
+      DEPLOY_MODE) [[ "${value}" =~ ^(app-only|native|docker)$ ]] && ACTIVE_DEPLOY_MODE="${value}" ;;
+    esac
+  done < "${PORT_STATE}"
+  [[ -n "${ACTIVE_FRONTEND_PORT}" && -n "${ACTIVE_BACKEND_PORT}" ]]
+}
+
+save_port_state() {
+  local mode="$1"
+  mkdir -p "${RUNTIME_DIR}"
+  {
+    printf 'FRONTEND_PORT=%s\n' "${FRONTEND_PORT}"
+    printf 'BACKEND_PORT=%s\n' "${BACKEND_PORT}"
+    printf 'DEPLOY_MODE=%s\n' "${mode}"
+  } > "${PORT_STATE}"
+}
+
+clear_port_state() {
+  [[ -f "${PORT_STATE}" ]] && unlink "${PORT_STATE}" || true
+}
+
+port_is_available() {
+  local port="$1"
+  python3 - "${port}" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError:
+        raise SystemExit(1)
+PY
+}
+
+find_available_port() {
+  local candidate="$1"
+  while (( candidate <= 9999 )); do
+    if port_is_available "${candidate}"; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+    ((candidate += 1))
+  done
+  return 1
+}
+
+select_runtime_ports() {
+  local mode="$1"
+  local requested_frontend="${FRONTEND_PORT:-5174}"
+  local requested_backend="${BACKEND_PORT:-8002}"
+  local reused=0
+  [[ "${requested_frontend}" =~ ^[0-9]{4}$ ]] || fail "FRONTEND_PORT 必須是四位數 port。"
+  [[ "${requested_backend}" =~ ^[0-9]{4}$ ]] || fail "BACKEND_PORT 必須是四位數 port。"
+
+  if read_port_state \
+    && [[ "${ACTIVE_DEPLOY_MODE}" == "${mode}" ]] \
+    && curl -fsS "http://127.0.0.1:${ACTIVE_FRONTEND_PORT}/" >/dev/null 2>&1 \
+    && curl -fsS "http://127.0.0.1:${ACTIVE_BACKEND_PORT}/api/health" >/dev/null 2>&1; then
+    FRONTEND_PORT="${ACTIVE_FRONTEND_PORT}"
+    BACKEND_PORT="${ACTIVE_BACKEND_PORT}"
+    reused=1
+  else
+    FRONTEND_PORT="$(find_available_port "${requested_frontend}")" \
+      || fail "找不到 ${requested_frontend} 之後可用的前端 port。"
+    BACKEND_PORT="$(find_available_port "${requested_backend}")" \
+      || fail "找不到 ${requested_backend} 之後可用的後端 port。"
+    if [[ "${FRONTEND_PORT}" == "${BACKEND_PORT}" ]]; then
+      BACKEND_PORT="$(find_available_port "$((BACKEND_PORT + 1))")" \
+        || fail "找不到可用的後端 port。"
+    fi
+  fi
+  export FRONTEND_PORT BACKEND_PORT
+
+  if [[ "${reused}" == "0" ]] \
+    && [[ "${FRONTEND_PORT}" != "${requested_frontend}" || "${BACKEND_PORT}" != "${requested_backend}" ]]; then
+    say "預設 port 已被占用，自動改用前端 ${FRONTEND_PORT}、後端 ${BACKEND_PORT}。"
+  fi
+}
+
+announce_runtime_ports() {
+  local label="$1"
+  local lan_ip
+  lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  say "${label}"
+  say "前端：http://127.0.0.1:${FRONTEND_PORT}/video-abstract-lab"
+  [[ -n "${lan_ip}" ]] && say "區網：http://${lan_ip}:${FRONTEND_PORT}/video-abstract-lab"
+  say "後端：http://127.0.0.1:${BACKEND_PORT}/docs"
+}
+
 stop_project_native() {
   local backend_port="${BACKEND_PORT:-8002}"
   local frontend_port="${FRONTEND_PORT:-5174}"
-  pkill -f "${PROJECT_ROOT}/backend/\\.venv/bin/python -m uvicorn backend\\.app\\.main:app .*--port ${backend_port}" 2>/dev/null || true
-  pkill -f "${PROJECT_ROOT}/frontend/node_modules/.bin/vite preview .*--port ${frontend_port}" 2>/dev/null || true
+  local backend_pattern="${PROJECT_ROOT}/backend/\\.venv/bin/python -m uvicorn backend\\.app\\.main:app .*--port ${backend_port}"
+  local frontend_pattern="${PROJECT_ROOT}/frontend/node_modules/.bin/vite preview .*--port ${frontend_port}"
+  pkill -f "${backend_pattern}" 2>/dev/null || true
+  pkill -f "${frontend_pattern}" 2>/dev/null || true
+  local i
+  for i in $(seq 1 50); do
+    if ! pgrep -f "${backend_pattern}" >/dev/null 2>&1 \
+      && ! pgrep -f "${frontend_pattern}" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.1
+  done
+  warn "本機服務仍在結束中，port 可能需要稍候才會釋放。"
 }
 
 prepare_app_only() {
@@ -360,6 +473,7 @@ prepare_app_only() {
 start_app_only() {
   ensure_app_config
   prepare_app_only
+  select_runtime_ports app-only
   local backend_port="${BACKEND_PORT:-8002}"
   local frontend_port="${FRONTEND_PORT:-5174}"
   local lan_ip
@@ -367,7 +481,8 @@ start_app_only() {
 
   if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
     && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-    say "基本前後端已在運作：http://127.0.0.1:${frontend_port}/video-abstract-lab"
+    save_port_state app-only
+    announce_runtime_ports "基本前後端已在運作。"
     return
   fi
 
@@ -390,7 +505,7 @@ start_app_only() {
     cd "${PROJECT_ROOT}/frontend"
     VITE_API_BASE_URL="/api" npm run build >/dev/null
     VITE_API_PROXY_TARGET="http://127.0.0.1:${backend_port}" \
-      nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
+      nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" --strictPort \
       >/dev/null 2>&1 < /dev/null &
   )
 
@@ -398,7 +513,8 @@ start_app_only() {
   for i in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
       && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-      say "基本前後端已啟動：http://127.0.0.1:${frontend_port}/video-abstract-lab"
+      save_port_state app-only
+      announce_runtime_ports "基本前後端已啟動。"
       say "此模式不載入 TTS／ASR／強制對齊模型。"
       return
     fi
@@ -413,11 +529,13 @@ start_app() {
   ensure_app_config
   if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
     prepare_models || fail "必要模型尚未就緒。可填寫 deploy/models.env，或手動放入 models/ 對應位置。"
+    select_runtime_ports native
     start_native
     return
   fi
   preflight
   prepare_models || fail "必要模型尚未就緒。可填寫 deploy/models.env，或手動放入 models/ 對應位置。"
+  select_runtime_ports docker
   # Never take down the working native service before a first Docker build has
   # completed. A failed build must not leave the user without a WebUI.
   if ! "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
@@ -430,7 +548,8 @@ start_app() {
   local i
   for i in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:${FRONTEND_PORT:-5174}/" >/dev/null 2>&1; then
-      say "SlideAI 已啟動：http://127.0.0.1:${FRONTEND_PORT:-5174}"
+      save_port_state docker
+      announce_runtime_ports "SlideAI 已啟動。"
       return 0
     fi
     sleep 2
@@ -447,7 +566,8 @@ start_native() {
   [[ -x "${PROJECT_ROOT}/backend/.venv/bin/python" ]] || fail "缺少 backend/.venv。"
   if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
     && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-    say "SlideAI 已在 native 模式運作：http://127.0.0.1:${frontend_port}"
+    save_port_state native
+    announce_runtime_ports "SlideAI 已在 native 模式運作。"
     return
   fi
   stop_project_native
@@ -486,14 +606,15 @@ start_native() {
     cd "${PROJECT_ROOT}/frontend"
     VITE_API_BASE_URL="/api" npm run build >/dev/null
     VITE_API_PROXY_TARGET="http://127.0.0.1:${backend_port}" \
-      nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" \
+      nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" --strictPort \
       >/dev/null 2>&1 < /dev/null &
   )
   local i
   for i in $(seq 1 45); do
     if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
       && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-      say "SlideAI 已以既有本機環境啟動：http://127.0.0.1:${frontend_port}"
+      save_port_state native
+      announce_runtime_ports "SlideAI 已以既有本機環境啟動。"
       return
     fi
     sleep 1
@@ -502,9 +623,14 @@ start_native() {
 }
 
 stop_app() {
+  read_port_state || true
+  [[ -n "${ACTIVE_FRONTEND_PORT:-}" ]] && FRONTEND_PORT="${ACTIVE_FRONTEND_PORT}"
+  [[ -n "${ACTIVE_BACKEND_PORT:-}" ]] && BACKEND_PORT="${ACTIVE_BACKEND_PORT}"
+  export FRONTEND_PORT BACKEND_PORT
   load_model_config 1
   stop_project_native
-  if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
+  if [[ "${ACTIVE_DEPLOY_MODE:-}" == "app-only" || "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
+    clear_port_state
     say "SlideAI 已停止。"
     return
   fi
@@ -519,6 +645,7 @@ stop_app() {
       warn "Docker daemon 無權限存取；若仍有容器，請執行 sudo ./slideai.sh stop。"
     fi
   fi
+  clear_port_state
   say "SlideAI 已停止。"
 }
 
@@ -565,12 +692,18 @@ setup_app() {
 }
 
 status_app() {
+  read_port_state || true
+  local frontend_port="${ACTIVE_FRONTEND_PORT:-${FRONTEND_PORT:-5174}}"
+  local backend_port="${ACTIVE_BACKEND_PORT:-${BACKEND_PORT:-8002}}"
+  printf 'Frontend %s: ' "${frontend_port}"
+  curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1 && say "running" || say "stopped"
+  printf 'Backend %s: ' "${backend_port}"
+  curl -fsS "http://127.0.0.1:${backend_port}/api/health" >/dev/null 2>&1 && say "running" || say "stopped"
   load_model_config 1
   if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
-    printf 'Frontend 5174: '
-    curl -fsS http://127.0.0.1:5174/ >/dev/null 2>&1 && say "running" || say "stopped"
-    printf 'Backend 8002: '
-    curl -fsS http://127.0.0.1:8002/docs >/dev/null 2>&1 && say "running" || say "stopped"
+    :
+  elif [[ "${ACTIVE_DEPLOY_MODE:-}" == "app-only" ]]; then
+    :
   else
     check_docker
     compose_cmd ps
