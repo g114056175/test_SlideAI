@@ -97,9 +97,12 @@ chmod +x slideai.sh
 
 啟動完成後：
 
-- WebUI：`http://localhost:5174`
+- 免登入工作區：`http://localhost:5174/video-abstract-lab`
 - Backend API：`http://localhost:8002`
 - OpenAPI 文件：`http://localhost:8002/docs`
+
+目前內部版的主要工作流不需要註冊或登入；`/login`、`/register` 與舊管理
+頁面是保留的相容路由，不是使用 `/video-abstract-lab` 的必要步驟。
 
 自動化環境仍可明確指定命令：
 
@@ -120,8 +123,9 @@ chmod +x slideai.sh
 ```
 
 此模式會建立精簡 `backend/.venv`、執行 `npm ci` 並啟動前後端，但不提供
-TTS、ASR 或強制對齊推論。可使用 `BACKEND_PORT`、`FRONTEND_PORT` 避免與
-既有服務衝突：
+LLM 講稿、TTS、ASR 或強制對齊推論。PDF 上傳、逐頁預覽、專案保存與前後
+端跳轉仍可測試；模型相關步驟會明確略過。可使用 `BACKEND_PORT`、
+`FRONTEND_PORT` 避免與既有服務衝突：
 
 ```bash
 BACKEND_PORT=8102 FRONTEND_PORT=5274 ./slideai.sh app-only
@@ -205,11 +209,13 @@ slideai.sh               唯一管理入口
 
 ```bash
 scripts/smoke_test.sh
+scripts/smoke_test.sh --pdf /path/to/test.pdf
 scripts/smoke_test.sh --full --pdf /path/to/test.pdf
 ```
 
-完整檢查包含 PDF、LLM、TTS、ASR、強制對齊、SRT、燒錄字幕／無字幕影片
-與合併輸出。
+第一個命令檢查前端、後端、歷史專案 API 與 CORS；加上 `--pdf` 會額外
+驗證免登入 PDF 上傳、run 建立與投影片影像，且不需要模型。`--full` 才會
+檢查 LLM、TTS、ASR、強制對齊、SRT、燒錄字幕／無字幕影片與合併輸出。
 
 ## 公開部署注意事項
 

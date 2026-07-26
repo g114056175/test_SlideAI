@@ -35,9 +35,12 @@ while [[ $# -gt 0 ]]; do
       cat <<'EOF'
 Usage:
   scripts/smoke_test.sh
+  scripts/smoke_test.sh --pdf /path/to/test.pdf
   scripts/smoke_test.sh --full --pdf /path/to/test.pdf
 
 Default checks HTTP, project history and LAN-style CORS without creating data.
+Providing --pdf also checks auth-free upload, persistent run creation and the
+first page image without loading model services.
 Full mode runs PDF -> LLM -> TTS -> ASR -> alignment -> subtitle/no-subtitle
 render -> persistent merge, then deletes its temporary run.
 EOF
@@ -51,7 +54,8 @@ for command_name in curl jq; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 
-curl -fsS "${FRONTEND_BASE}/" >/dev/null || fail "frontend unavailable: ${FRONTEND_BASE}"
+curl -fsS "${FRONTEND_BASE}/video-abstract-lab" >/dev/null \
+  || fail "lab frontend unavailable: ${FRONTEND_BASE}/video-abstract-lab"
 curl -fsS "${API_BASE}/" | jq -e '.status == "running"' >/dev/null || fail "backend health failed"
 curl -fsS "${API_BASE}/api/video-runs" | jq -e '.runs | type == "array"' >/dev/null \
   || fail "video-run history failed"
@@ -67,11 +71,12 @@ cors_code="$(
 [[ "${cors_code}" == "200" ]] || fail "private-LAN CORS failed (${cors_code})"
 say "PASS: frontend, backend, project history, LLM status and CORS"
 
-[[ "${FULL}" == "1" ]] || exit 0
-[[ -f "${PDF_PATH}" ]] || fail "--full requires an existing --pdf file"
-for command_name in ffprobe file; do
-  command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
-done
+if [[ -z "${PDF_PATH}" ]]; then
+  [[ "${FULL}" == "0" ]] && exit 0
+  fail "--full requires an existing --pdf file"
+fi
+[[ -f "${PDF_PATH}" ]] || fail "PDF not found: ${PDF_PATH}"
+command -v file >/dev/null 2>&1 || fail "missing command: file"
 
 TEMP_DIR="$(mktemp -d /tmp/slideai-smoke.XXXXXX)"
 upload_json="${TEMP_DIR}/upload.json"
@@ -90,11 +95,15 @@ PDF_ID="$(jq -r '.pdf_id // empty' "${upload_json}")"
 [[ -n "${RUN_ID}" && -n "${PDF_ID}" ]] || fail "upload returned no run_id/pdf_id"
 
 slide_image="${TEMP_DIR}/slide.jpg"
-if ! curl -fsS "${API_BASE}/api/video-runs/${RUN_ID}/pages/0/image" -o "${slide_image}"; then
+if ! curl -fs "${API_BASE}/api/video-runs/${RUN_ID}/pages/0/image" -o "${slide_image}"; then
   curl -fsS "${API_BASE}/api/video-runs/${RUN_ID}/thumbnail?page=1" -o "${slide_image}" \
     || fail "page image failed"
 fi
 file "${slide_image}" | grep -Eq 'JPEG|PNG' || fail "page image is invalid"
+say "PASS: auth-free PDF upload, persistent run and page image"
+
+[[ "${FULL}" == "1" ]] || exit 0
+command -v ffprobe >/dev/null 2>&1 || fail "missing command: ffprobe"
 
 if curl -fsS "${API_BASE}/api/llm/status" | jq -e '.configured == true' >/dev/null; then
   curl -fsS -H 'Content-Type: application/json' \

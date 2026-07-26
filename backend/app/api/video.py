@@ -518,6 +518,10 @@ async def video_abstract_api(
             "project_id": project_id,
             "run_id": run_id,
             "run": run_manifest,
+            # The lightweight app-only launcher intentionally has no LLM/model
+            # services. Tell the SPA not to immediately start a second,
+            # model-dependent request after the PDF upload has succeeded.
+            "model_services_skipped": bool(mock_mode),
         })
 
     # 舊版 JSON 產片主流程已停用（EdgeTTS / 舊字幕估算 / 舊 MoviePy 管線）

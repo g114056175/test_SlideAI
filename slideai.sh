@@ -368,7 +368,7 @@ start_app_only() {
 
   if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
     && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-    say "基本前後端已在運作：http://127.0.0.1:${frontend_port}"
+    say "基本前後端已在運作：http://127.0.0.1:${frontend_port}/video-abstract-lab"
     return
   fi
 
@@ -398,7 +398,7 @@ start_app_only() {
   for i in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
       && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-      say "基本前後端已啟動：http://127.0.0.1:${frontend_port}"
+      say "基本前後端已啟動：http://127.0.0.1:${frontend_port}/video-abstract-lab"
       say "此模式不載入 TTS／ASR／強制對齊模型。"
       return
     fi

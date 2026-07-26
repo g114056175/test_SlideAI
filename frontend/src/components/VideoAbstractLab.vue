@@ -1937,7 +1937,10 @@ const handleUpload = async () => {
     selectedSlideIndex.value = 0
     renderedPageVideos.value = {}
 
-    const shouldAutoGenerate = subtitleSource.value === 'zh' || subtitleSource.value === 'en'
+    const shouldAutoGenerate = (
+      (subtitleSource.value === 'zh' || subtitleSource.value === 'en')
+      && data?.model_services_skipped !== true
+    )
 
     if (currentRunId.value) {
       refreshSidebarRuns()
@@ -1957,7 +1960,9 @@ const handleUpload = async () => {
       }
       stage.value = 'workspace'
       activeTab.value = 'script'
-      statusMessage.value = `上傳成功，共 ${slides.value.length} 頁。`
+      statusMessage.value = data?.model_services_skipped === true
+        ? `上傳成功，共 ${slides.value.length} 頁；目前為基本前後端模式，已跳過 AI 講稿生成。`
+        : `上傳成功，共 ${slides.value.length} 頁。`
     } else if (pdfId.value) {
       Promise
         .all(slides.value.map((_, idx) => fetchThumbnail(idx, pdfId.value)))
