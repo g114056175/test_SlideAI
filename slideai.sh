@@ -634,9 +634,13 @@ hf_download() {
       -e HF_REPO="${repository}" \
       -e HF_TOKEN="${HF_TOKEN:-}" \
       -e HF_HUB_DISABLE_TELEMETRY=1 \
+      -e HOME=/tmp \
+      -e HF_HOME=/tmp/huggingface \
       -v "${target}:/download" \
       python:3.12-slim \
-      sh -c 'python -m pip install --quiet --no-cache-dir huggingface_hub && hf download "$HF_REPO" --local-dir /download'
+      sh -c 'python -m venv /tmp/hf-venv \
+        && /tmp/hf-venv/bin/pip install --quiet --no-cache-dir huggingface_hub \
+        && /tmp/hf-venv/bin/hf download "$HF_REPO" --local-dir /download'
     return
   fi
 
