@@ -139,9 +139,12 @@ HTTPS、來源限制、用量控制並重新審查檔案存取權限。
 ## 驗證
 
 ```bash
+scripts/portability_check.sh
 scripts/smoke_test.sh
 scripts/smoke_test.sh --pdf /path/to/test.pdf
 ```
 
-第一個命令檢查前後端與 API；第二個會額外驗證 PDF 上傳、持久化專案與頁面
-影像。完整 GPU 產線可使用 `--full`，但會實際載入模型並產生影片。
+`portability_check.sh` 檢查啟動腳本、Compose、Git 排除規則及本機已安裝的
+測試環境；`smoke_test.sh` 檢查前後端與 API，加入 PDF 時會額外驗證上傳、
+持久化專案與頁面影像。完整 GPU 產線可使用 `--full`，但會實際載入模型並
+產生影片。
