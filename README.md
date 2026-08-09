@@ -43,6 +43,11 @@ chmod +x slideai.sh
 Qwen3 TTS 也是選用備援。它與 Qwen3 ASR 鎖定不同的 Transformers 版本，
 因此選用時會建立獨立環境；預設 VoxCPM2 工作流不會下載這套環境與模型。
 
+官方 VoxCPM2 的參考音訊降噪為選用功能。SlideAI 預設不載入額外的
+ZipEnhancer，以避免第一次合成時臨時連線 ModelScope；只有參考音檔本身
+帶有明顯噪音時，才需在 `deploy/models.env` 開啟
+`VOXTTS_ENABLE_DENOISER` 與 `VOXTTS_DENOISE_REFERENCE`。
+
 ## WebUI 使用
 
 1. 上傳 PDF，選擇 AI 生成講稿或自行填寫逐頁講稿。

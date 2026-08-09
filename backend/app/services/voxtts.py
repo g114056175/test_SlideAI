@@ -38,6 +38,9 @@ class VoxTTSConfig:
     model_path: str
     runtime_python: str
     optimize: bool
+    load_denoiser: bool
+    denoise_reference: bool
+    zipenhancer_model_path: str
     infer_timeout_sec: int
     asr_runtime_python: str
     asr_model_path: str
@@ -63,6 +66,16 @@ def load_voxtts_config() -> VoxTTSConfig:
             str(DEFAULT_RUNTIMES_DIR / "voxcpm" / ".venv" / "bin" / "python"),
         ).strip(),
         optimize=_to_bool(os.getenv("VOXTTS_OPTIMIZE"), False),
+        # ZipEnhancer is an optional ModelScope model, not part of VoxCPM2.
+        # Keep it off by default so the first TTS request never performs a
+        # hidden network download.  This also matches the official WebUI's
+        # default for prompt-audio denoising.
+        load_denoiser=_to_bool(os.getenv("VOXTTS_ENABLE_DENOISER"), False),
+        denoise_reference=_to_bool(os.getenv("VOXTTS_DENOISE_REFERENCE"), False),
+        zipenhancer_model_path=os.getenv(
+            "VOXTTS_ZIPENHANCER_MODEL_PATH",
+            "iic/speech_zipenhancer_ans_multiloss_16k_base",
+        ).strip(),
         infer_timeout_sec=int(os.getenv("VOXTTS_INFER_TIMEOUT_SEC", "600")),
         asr_runtime_python=os.getenv(
             "QWEN3_ASR_RUNTIME_PYTHON",
@@ -450,7 +463,8 @@ from voxcpm import VoxCPM
 
 model = VoxCPM.from_pretrained(
     {_py_literal(config.model_path)},
-    load_denoiser=True,
+    load_denoiser={_py_literal(config.load_denoiser)},
+    zipenhancer_model_id={_py_literal(config.zipenhancer_model_path)},
     optimize={_py_literal(config.optimize)},
 )
 
@@ -458,7 +472,7 @@ kwargs = dict(
     cfg_value=2.0,
     inference_timesteps={_py_literal(config.nano_timesteps)},
     normalize=False,
-    denoise=True,
+    denoise={_py_literal(config.load_denoiser and config.denoise_reference)},
 )
 
 reference_audio = {_py_literal(reference_audio_path)}
@@ -501,7 +515,11 @@ print(json.dumps({{"output_path": {_py_literal(output_path)}}}, ensure_ascii=Fal
         msg = (proc.stderr or proc.stdout or "voxtts infer failed").strip()
         for part_path in part_paths:
             Path(part_path).unlink(missing_ok=True)
-        return False, None, msg[:1200]
+        # Tracebacks and download errors are normally at the end.  Returning
+        # the prefix hid the actual failure behind progress-bar output.
+        if len(msg) > 2400:
+            msg = "…\n" + msg[-2400:]
+        return False, None, msg
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         for part_path in part_paths:
             Path(part_path).unlink(missing_ok=True)
