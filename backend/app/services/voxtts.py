@@ -8,6 +8,8 @@ import textwrap
 import threading
 import uuid
 import signal
+import shutil
+from collections import deque
 import numpy as np
 import soundfile as sf
 from dataclasses import dataclass
@@ -177,6 +179,17 @@ def _check_voxtts_ready(config: VoxTTSConfig) -> Tuple[bool, str]:
 _NANO_WORKER: Optional[subprocess.Popen] = None
 _NANO_WORKER_LOCK = threading.RLock()
 _NANO_IDLE_TIMER: Optional[threading.Timer] = None
+_NANO_WORKER_STDERR: deque[str] = deque(maxlen=40)
+
+
+def _drain_nano_worker_stderr(proc: subprocess.Popen) -> None:
+    if not proc.stderr:
+        return
+    for line in proc.stderr:
+        text = str(line or "").strip()
+        if text:
+            _NANO_WORKER_STDERR.append(text)
+            logger.debug("[Nano-VLLM VoxCPM][worker] %s", text)
 
 
 def _stop_nano_worker() -> None:
@@ -234,15 +247,20 @@ def _ensure_nano_worker(config: VoxTTSConfig) -> subprocess.Popen:
     _cancel_nano_idle_shutdown_locked()
     if _NANO_WORKER and _NANO_WORKER.poll() is None:
         return _NANO_WORKER
+    _NANO_WORKER_STDERR.clear()
     _NANO_WORKER = subprocess.Popen(
         [config.runtime_python, config.nano_worker_path, config.model_path, str(config.nano_timesteps), str(config.nano_gpu_memory_utilization)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1, start_new_session=True,
     )
+    threading.Thread(target=_drain_nano_worker_stderr, args=(_NANO_WORKER,), daemon=True).start()
     ready = _NANO_WORKER.stdout.readline().strip() if _NANO_WORKER.stdout else ""
     if not ready.startswith("__NANO_VOX_RESULT__"):
+        detail = " | ".join(_NANO_WORKER_STDERR)[-1600:]
         _stop_nano_worker()
-        raise RuntimeError("Nano-vLLM worker failed to become ready")
+        if "out of memory" in detail.lower() or "cuda" in detail.lower():
+            raise RuntimeError(f"Nano-vLLM worker failed to become ready (GPU/CUDA): {detail}")
+        raise RuntimeError(f"Nano-vLLM worker failed to become ready{f': {detail}' if detail else ''}")
     return _NANO_WORKER
 
 
@@ -281,6 +299,13 @@ def _run_nanovllm_chunked_infer(*, config: VoxTTSConfig, text: str, output_path:
         return False, None, "no text chunks generated"
     if len(chunks) == 1:
         result = _run_nanovllm_infer(config=config, text=chunks[0], output_path=output_path, reference_audio_path=reference_audio_path, auxiliary_text=auxiliary_text)
+        if result[0] and os.path.isfile(output_path):
+            _persist_chunk_artifacts(
+                output_path=output_path,
+                chunks=chunks,
+                part_paths=[output_path],
+                silence_ms=0.0,
+            )
         _schedule_nano_idle_shutdown(config)
         return result
 
@@ -309,6 +334,12 @@ def _run_nanovllm_chunked_infer(*, config: VoxTTSConfig, text: str, output_path:
             if index < len(part_paths) - 1 and silence_ms:
                 audio_parts.append(np.zeros(int(sample_rate * silence_ms / 1000.0), dtype=np.float32))
         sf.write(output_path, np.concatenate(audio_parts), sample_rate)
+        _persist_chunk_artifacts(
+            output_path=output_path,
+            chunks=chunks,
+            part_paths=part_paths,
+            silence_ms=silence_ms,
+        )
         logger.info("[Nano-VLLM VoxCPM] generated %d punctuation chunks", len(chunks))
         return True, output_path, "ok"
     finally:
@@ -318,6 +349,43 @@ def _run_nanovllm_chunked_infer(*, config: VoxTTSConfig, text: str, output_path:
                 os.remove(part_path)
             except OSError:
                 pass
+
+
+def _persist_chunk_artifacts(
+    *,
+    output_path: str,
+    chunks: List[str],
+    part_paths: List[str],
+    silence_ms: float,
+) -> None:
+    """Keep deterministic four-sentence boundaries for later local regeneration."""
+    chunks_dir = Path(output_path).with_suffix(".chunks")
+    shutil.rmtree(chunks_dir, ignore_errors=True)
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    timeline = []
+    cursor = 0.0
+    for index, (text, part_path) in enumerate(zip(chunks, part_paths)):
+        info = sf.info(part_path)
+        duration = float(info.frames) / float(info.samplerate or 1)
+        filename = f"chunk_{index + 1:03d}.wav"
+        destination = chunks_dir / filename
+        if Path(part_path).resolve() != destination.resolve():
+            shutil.copy2(part_path, destination)
+        timeline.append({
+            "index": index,
+            "text": text,
+            "start": round(cursor, 6),
+            "end": round(cursor + duration, 6),
+            "duration": round(duration, 6),
+            "filename": filename,
+        })
+        cursor += duration
+        if index < len(chunks) - 1:
+            cursor += max(0.0, silence_ms) / 1000.0
+    (chunks_dir / "chunks.json").write_text(
+        json.dumps({"silence_ms": silence_ms, "chunks": timeline}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _build_vox_final_text(text: str, control_instruction: str) -> str:

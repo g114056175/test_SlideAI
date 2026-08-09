@@ -130,7 +130,8 @@ def apply_audio_speed(src_path: str, speed: float) -> str:
         return src_path
 
     suffix = os.path.splitext(src_path or "")[-1] or ".wav"
-    out_path = tempfile.mktemp(suffix=suffix)
+    out_fd, out_path = tempfile.mkstemp(prefix="slideai_speed_", suffix=suffix)
+    os.close(out_fd)
     proc = subprocess.run(
         [
             "ffmpeg",

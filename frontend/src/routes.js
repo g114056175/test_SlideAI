@@ -1,12 +1,12 @@
-import Register from "./components/Register.vue";
-import Login from "./components/Login.vue";
-import ForgotPassword from "./components/ForgotPassword.vue";
-import ResetPassword from "./components/ResetPassword.vue";
-import Dashboard from "./components/Dashboard.vue";
-import Landing from "./components/Landing.vue";
-import VideoAbstract from "./components/VideoAbstract.vue";
-import VideoAbstractLab from "./components/VideoAbstractLab.vue";
-import AdminDashboard from "./components/AdminDashboard.vue";
+const Register = () => import("./components/Register.vue");
+const Login = () => import("./components/Login.vue");
+const ForgotPassword = () => import("./components/ForgotPassword.vue");
+const ResetPassword = () => import("./components/ResetPassword.vue");
+const Dashboard = () => import("./components/Dashboard.vue");
+const Landing = () => import("./components/Landing.vue");
+const VideoAbstract = () => import("./components/VideoAbstract.vue");
+const VideoAbstractLab = () => import("./components/VideoAbstractLab.vue");
+const AdminDashboard = () => import("./components/AdminDashboard.vue");
 
 const routes = [
   { path: "/", component: Landing },

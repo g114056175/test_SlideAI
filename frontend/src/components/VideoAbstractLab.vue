@@ -88,7 +88,7 @@
                 :rendering-page-status="renderingPageStatus"
                 :variant-counts="variantCountsByPage"
                 :has-merged-preview="activeTab === 'preview' && hasMergedPreview"
-                :merged-preview-thumbnail-url="mergedPreviewThumbnailUrl"
+                :merged-preview-thumbnail-url="mergedPreviewThumbnailDisplayUrl"
                 :selected-merged-preview="isMergedPreviewSelected"
                 @update:selected-index="handleSlideIndexChange"
                 @select-merged-preview="selectMergedPreviewPage"
@@ -118,14 +118,14 @@
                       </div>
                     </div>
                   </div>
-                  
+
                   <div
                     class="resizer-y"
                     title="拖曳調整預覽與講稿區比例"
                     @mousedown.prevent="startYDrag"
                     @touchstart.prevent="startYDrag"
                   ></div>
-                  
+
                   <textarea
                     v-if="selectedSlide"
                     v-model="selectedSlide.scriptText"
@@ -189,25 +189,44 @@
                 <!-- Single Page Preview -->
                 <div v-else class="panel-view d-flex flex-column gap-3">
                   <div class="preview-output-layout">
-                    <PageVariantPanel
-                      v-if="!isMergedPreviewSelected && selectedPageVariants.length"
-                      :run-id="currentRunId || ''"
-                      :page-index="selectedSlideIndex"
-                      :variants="selectedPageVariants"
-                      :selected-variant-id="selectedPageVariantId"
-                      @select="selectPageVariant"
-                      @delete="deletePageVariant"
-                    />
-                    <PageVariantPanel
-                      v-else-if="isMergedPreviewSelected && exportVariants.length"
-                      :run-id="currentRunId || ''"
-                      title="ALL"
-                      kicker="合併影片"
-                      :variants="exportVariants"
-                      :selected-variant-id="selectedExportVariantId"
-                      @select="selectMergedExportVariant"
-                      @delete="deleteMergedExportVariant"
-                    />
+                    <div
+                      v-if="hasVariantDrawer"
+                      class="variant-drawer"
+                      :class="{ collapsed: !variantDrawerOpen }"
+                    >
+                      <div class="variant-drawer-clip">
+                        <div class="variant-drawer-body">
+                          <PageVariantPanel
+                            v-if="!isMergedPreviewSelected"
+                            :run-id="currentRunId || ''"
+                            :page-index="selectedSlideIndex"
+                            :variants="selectedPageVariants"
+                            :selected-variant-id="selectedPageVariantId"
+                            :chunk-regenerating="rendering"
+                            @select="selectPageVariant"
+                            @delete="deletePageVariant"
+                            @regenerate-chunk="regenerateTtsChunk"
+                          />
+                          <PageVariantPanel
+                            v-else
+                            :run-id="currentRunId || ''"
+                            title="ALL"
+                            kicker="合併影片"
+                            :variants="exportVariants"
+                            :selected-variant-id="selectedExportVariantId"
+                            @select="selectMergedExportVariant"
+                            @delete="deleteMergedExportVariant"
+                          />
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        class="variant-drawer-toggle"
+                        :title="variantDrawerOpen ? '收起產出影片' : '展開產出影片'"
+                        :aria-label="variantDrawerOpen ? '收起產出影片' : '展開產出影片'"
+                        @click="variantDrawerOpen = !variantDrawerOpen"
+                      ><span class="variant-drawer-chevron" :class="{ open: variantDrawerOpen }" aria-hidden="true"></span></button>
+                    </div>
                     <div class="preview-render-zone">
                       <div class="preview-panel final flex-grow-1">
                         <video
@@ -232,18 +251,22 @@
                         :queue-length="singleRenderQueue.length"
                         :cancellable-single-pages="cancellableSinglePages"
                         :message="renderMessage"
-                        :has-selected-srt="hasSelectedSrt"
+                        :download-video-url="selectedPageDownloadVideoUrl"
+                        :download-srt-url="selectedPageDownloadSrtUrl"
+                        :download-bundle-url="selectedPageDownloadBundleUrl"
                         @render-current="renderCurrentPage"
                         @render-all="renderAllPages"
                         @stop-all="requestStopAllRendering"
                         @stop-page="requestStopPage"
                         @merge="mergeAndDownloadRenderedVideos"
-                        @download-srt="downloadSelectedPageSrt"
                       />
                       <div v-else class="merged-export-controls">
-                        <a class="btn btn-success" :href="exportVideoUrl(selectedExportVariantId)" download>下載合併影片</a>
-                        <a v-if="hasSelectedExportSrt" class="btn btn-outline-info" :href="exportSrtUrl(selectedExportVariantId)" download>下載合併 SRT</a>
-                        <span v-else class="merged-export-note">此合併版本尚無 SRT；重新合併含字幕的頁面即可建立。</span>
+                        <DownloadMenu
+                          label="下載合併檔案"
+                          :video-url="exportVideoUrl(selectedExportVariantId)"
+                          :srt-url="hasSelectedExportSrt ? exportSrtUrl(selectedExportVariantId) : ''"
+                          :bundle-url="exportBundleUrl(selectedExportVariantId)"
+                        />
                       </div>
                     </div>
                   </div>
@@ -261,6 +284,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from 'vue'
 import AppShell from './AppShell.vue'
 import PageVariantPanel from './PageVariantPanel.vue'
+import DownloadMenu from './DownloadMenu.vue'
 import RenderControls from './RenderControls.vue'
 import SlideStrip from './SlideStrip.vue'
 import SubtitleSettingsPanel from './SubtitleSettingsPanel.vue'
@@ -304,6 +328,7 @@ const renderedPageVideos = ref({})
 const mergedPreviewVideoUrl = ref('')
 const mergedPreviewThumbnailUrl = ref('')
 const isMergedPreviewSelected = ref(false)
+const variantDrawerOpen = ref(false)
 const runManifest = ref(null)
 const selectedVariantIds = ref({})
 const suppressScriptSave = ref(false)
@@ -565,8 +590,10 @@ const {
   selectedExportVariantId,
   variantVideoUrl,
   variantSrtUrl,
+  variantBundleUrl,
   exportVideoUrl,
   exportSrtUrl,
+  exportBundleUrl,
   refreshRunManifest,
   selectPageVariant,
   deletePageVariant,
@@ -586,16 +613,9 @@ const selectedPageVariant = computed(() => selectedPageVariants.value.find(
   (variant) => variant.variant_id === selectedPageVariantId.value,
 ) || null)
 const hasSelectedSrt = computed(() => Boolean(selectedPageVariant.value?.paths?.srt))
-const downloadSelectedPageSrt = () => {
-  const url = variantSrtUrl(selectedSlideIndex.value, selectedPageVariantId.value)
-  if (!url) return
-  const link = document.createElement('a')
-  link.href = url
-  link.download = ''
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-}
+const selectedPageDownloadVideoUrl = computed(() => variantVideoUrl(selectedSlideIndex.value, selectedPageVariantId.value) || selectedRenderedVideoUrl.value || '')
+const selectedPageDownloadSrtUrl = computed(() => hasSelectedSrt.value ? variantSrtUrl(selectedSlideIndex.value, selectedPageVariantId.value) : '')
+const selectedPageDownloadBundleUrl = computed(() => variantBundleUrl(selectedSlideIndex.value, selectedPageVariantId.value))
 const selectedExportVariant = computed(() => exportVariants.value.find(
   (variant) => variant.variant_id === selectedExportVariantId.value,
 ) || null)
@@ -603,6 +623,12 @@ const hasSelectedExportSrt = computed(() => Boolean(selectedExportVariant.value?
 
 const hasMergedPreview = computed(() => Boolean(
   mergedPreviewVideoUrl.value || selectedExportVariantId.value || exportVariants.value.length,
+))
+const mergedPreviewThumbnailDisplayUrl = computed(() => (
+  mergedPreviewThumbnailUrl.value
+  || slides.value[0]?.thumbnailUrl
+  || slides.value[0]?.previewUrl
+  || ''
 ))
 const sanitizeDownloadName = (value, fallback = 'video') => {
   const cleaned = String(value || '')
@@ -633,6 +659,10 @@ const selectedRenderedVideoUrl = computed(() => {
   return renderedPageVideos.value[selectedSlideIndex.value] || ''
 })
 
+const hasVariantDrawer = computed(() => isMergedPreviewSelected.value
+  ? exportVariants.value.length > 0
+  : selectedPageVariants.value.length > 0)
+
 const {
   singleRenderQueue,
   renderingPageStatus,
@@ -641,6 +671,8 @@ const {
   requestStopPage,
   renderCurrentPage,
   renderAllPages,
+  reattachActiveBatchJob,
+  regenerateTtsChunk,
   mergeAndDownloadRenderedVideos,
 } = useRenderQueue({
   slides,
@@ -899,9 +931,9 @@ const subtitleOverlayPieces = computed(() => {
       const w = timelineWords[i]
       const subPieces = tokenizeSubtitlePieces(w.text)
       for (const sp of subPieces) {
-        pieces.push({ 
-          text: sp.text, 
-          highlightable: sp.highlightable, 
+        pieces.push({
+          text: sp.text,
+          highlightable: sp.highlightable,
           active: sp.highlightable && (i === activeWordIdx)
         })
       }
@@ -1113,9 +1145,9 @@ const computedSubtitleFontSize = computed(() => {
 const effectiveSubtitleFontSize = computed(() => {
   const containerW = subtitlePreviewContainerWidth.value || 0
   const scale = containerW < 1 ? 1 : containerW / BASE_CANVAS_WIDTH
-  
+
   let baseSize = Number(globalSettings.value.subtitle.fontSize || 20)
-  
+
   return `${Math.max(11, Math.round(baseSize * scale))}px`
 })
 
@@ -1876,6 +1908,9 @@ const handleShellProjectSelect = async (project) => {
     if (hasMergedPreview.value) {
       mergedPreviewThumbnailUrl.value = mergedPreviewThumbnailUrl.value || slides.value[0]?.thumbnailUrl || slides.value[0]?.previewUrl || ''
     }
+    reattachActiveBatchJob().catch((err) => {
+      console.warn('[BatchJob] reattach failed:', err)
+    })
   } catch (err) {
     errorMessage.value = err.message || '載入 run 失敗'
   } finally {
@@ -2319,7 +2354,7 @@ const backToUpload = async () => {
 const handleKeyDown = (e) => {
   // 只在進入工作區後才能切換
   if (stage.value !== 'workspace') return
-  
+
   // 如果使用者正在輸入文字，不應觸發切換
   const activeTag = document.activeElement ? document.activeElement.tagName : ''
   if (activeTag === 'TEXTAREA' || activeTag === 'INPUT') return
@@ -2619,6 +2654,87 @@ onBeforeUnmount(() => {
   background: #0f172a;
 }
 
+.variant-drawer {
+  position: relative;
+  width: 210px;
+  flex: 0 0 210px;
+  min-width: 0;
+  height: 100%;
+  transition: width 0.18s ease, flex-basis 0.18s ease;
+  z-index: 12;
+}
+
+.variant-drawer.collapsed {
+  width: 0;
+  flex-basis: 0;
+}
+
+.variant-drawer-clip {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.variant-drawer-body {
+  width: 210px;
+  height: 100%;
+  transition: opacity 0.12s ease;
+}
+
+.variant-drawer.collapsed .variant-drawer-body {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.variant-drawer-toggle {
+  position: absolute;
+  right: -20px;
+  top: 50%;
+  width: 20px;
+  height: 56px;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  border: 1px solid #26364d;
+  border-left: 0;
+  border-radius: 0 6px 6px 0;
+  color: #7dd3fc;
+  background: linear-gradient(90deg, #0b1220, #172033);
+  box-shadow: 4px 0 10px rgba(2, 6, 23, 0.24);
+  line-height: 1;
+  z-index: 3;
+  padding: 0;
+}
+
+.variant-drawer :deep(.variant-panel) {
+  width: 210px;
+  flex-basis: 210px;
+}
+
+.variant-drawer.collapsed .variant-drawer-toggle {
+  border-left: 1px solid #26364d;
+  border-radius: 0 6px 6px 0;
+}
+
+.variant-drawer-chevron {
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);
+  transform-origin: center;
+}
+
+.variant-drawer-chevron.open {
+  transform: rotate(135deg);
+}
+
+.variant-drawer-toggle:hover {
+  color: #ffffff;
+  border-color: #38bdf8;
+  background: #1e3a5f;
+}
+
 .preview-render-zone {
   flex: 1 1 auto;
   min-width: 0;
@@ -2635,6 +2751,37 @@ onBeforeUnmount(() => {
   .preview-output-layout {
     flex-direction: column;
     overflow: auto;
+  }
+
+  .variant-drawer {
+    width: 100%;
+    flex: 0 0 150px;
+    height: 150px;
+    transition: height 0.18s ease, flex-basis 0.18s ease;
+  }
+
+  .variant-drawer.collapsed {
+    width: 100%;
+    height: 0;
+    flex-basis: 0;
+  }
+
+  .variant-drawer-body {
+    width: 100%;
+  }
+
+  .variant-drawer :deep(.variant-panel) {
+    width: 100%;
+    flex-basis: auto;
+  }
+
+  .variant-drawer-toggle {
+    right: 18px;
+    top: 100%;
+    width: 46px;
+    height: 26px;
+    transform: none;
+    border-radius: 0 0 8px 8px;
   }
 
   .preview-render-zone {
@@ -2770,16 +2917,50 @@ onBeforeUnmount(() => {
 .merged-export-controls {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
   min-height: 64px;
   padding: 12px 14px;
   border-top: 1px solid #334155;
-  background: #111827;
+  background: #0f172a;
 }
 
 .merged-export-note {
+  margin-right: auto;
   color: #94a3b8;
   font-size: 13px;
+}
+
+.export-download-primary,
+.export-download-secondary {
+  min-width: 132px;
+  border-radius: 7px;
+  font-weight: 700;
+}
+
+.export-download-primary {
+  color: #ffffff;
+  border: 1px solid #3b82f6;
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  box-shadow: 0 5px 14px rgba(37, 99, 235, 0.2);
+}
+
+.export-download-primary:hover {
+  color: #ffffff;
+  border-color: #60a5fa;
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+}
+
+.export-download-secondary {
+  color: #bae6fd;
+  border: 1px solid #0369a1;
+  background: #0c2438;
+}
+
+.export-download-secondary:hover {
+  color: #e0f2fe;
+  border-color: #38bdf8;
+  background: #0c4a6e;
 }
 
 /* ── Dummy Slide (字幕預覽) ───────────────────────────────── */

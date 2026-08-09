@@ -1,4 +1,4 @@
-import PyPDF2
+import pypdf as PyPDF2
 
 def pdf_to_text_array(pdf_path):
     texts = []

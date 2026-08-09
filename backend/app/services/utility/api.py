@@ -9,6 +9,7 @@ import base64
 import numpy as np
 import requests
 import logging
+import threading
 from PIL import Image
 from backend.app.services.utility.text import *
 import soundfile as sf
@@ -20,6 +21,24 @@ import soundfile as sf
 # ─────────────────────────────────────────────────────────────
 _gemini_response_cache: dict = {}
 logger = logging.getLogger("video_abstract")
+
+
+def _configured_llm_concurrency() -> int:
+	try:
+		return max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "3")))
+	except (TypeError, ValueError):
+		return 3
+
+
+# This is process-global rather than request-local: five users do not each get
+# three independent API slots. The production launcher intentionally runs one
+# backend process, so the limit is shared by every active request.
+_LLM_REQUEST_SLOTS = threading.BoundedSemaphore(_configured_llm_concurrency())
+
+
+def _with_llm_request_slot(callable_):
+	with _LLM_REQUEST_SLOTS:
+		return callable_()
 
 def get_google_generative_model_name() -> str:
 	return os.getenv("GOOGLE_GENERATIVE_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")).strip() or "gemini-2.5-flash"
@@ -68,6 +87,10 @@ def get_groq_model_name() -> str:
 	return os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 
 
+def get_custom_llm_model_name() -> str:
+	return os.getenv("CUSTOM_LLM_MODEL", os.getenv("EXTERNAL_LLM_MODEL", "")).strip()
+
+
 def get_llm_model_name(provider: str) -> str:
 	if provider == "google":
 		return get_google_generative_model_name()
@@ -79,6 +102,8 @@ def get_llm_model_name(provider: str) -> str:
 		return get_xai_model_name()
 	if provider == "groq":
 		return get_groq_model_name()
+	if provider == "custom":
+		return get_custom_llm_model_name()
 	return get_openai_model_name()
 
 
@@ -94,11 +119,14 @@ def get_chat_completion_endpoint(provider: str) -> str:
 		"openrouter": ("OPENROUTER_ENDPOINT",),
 		"xai": ("XAI_ENDPOINT",),
 		"groq": ("GROQ_ENDPOINT",),
+		"custom": ("CUSTOM_LLM_ENDPOINT", "EXTERNAL_LLM_ENDPOINT"),
 	}
 	for env_name in override_names.get(provider, ()):
 		value = os.getenv(env_name, "").strip()
 		if value:
 			return value
+	if provider == "custom":
+		return ""
 	return defaults.get(provider, defaults["openai"])
 
 
@@ -106,18 +134,64 @@ def get_anthropic_endpoint() -> str:
 	return os.getenv("ANTHROPIC_ENDPOINT", "https://api.anthropic.com/v1/messages").strip()
 
 
-def get_llm_api_key() -> str:
-	return (
-		os.getenv("api_key", "")
-		or os.getenv("GOOGLE_API_KEY", "")
-		or os.getenv("GEMINI_API_KEY", "")
-		or os.getenv("OPENAI_API_KEY", "")
-		or os.getenv("ANTHROPIC_API_KEY", "")
-		or os.getenv("OPENROUTER_API_KEY", "")
-		or os.getenv("XAI_API_KEY", "")
-		or os.getenv("GROQ_API_KEY", "")
-		or os.getenv("EXTERNAL_LLM_API_KEY", "")
-	).strip()
+def get_llm_api_key(provider: str | None = None) -> str:
+	"""Return the credential belonging to the selected provider.
+
+	The legacy ``api_key`` variable remains a fallback, but it must not override
+	a provider-specific credential when users switch vendors by editing .env.
+	"""
+	selected = (provider or os.getenv("LLM_PROVIDER", "")).strip().lower()
+	selected = {
+		"gemini": "google",
+		"claude": "anthropic",
+		"openai-compatible": "custom",
+		"openai_compatible": "custom",
+	}.get(selected, selected)
+	provider_vars = {
+		"google": ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+		"openai": ("OPENAI_API_KEY",),
+		"anthropic": ("ANTHROPIC_API_KEY",),
+		"openrouter": ("OPENROUTER_API_KEY",),
+		"xai": ("XAI_API_KEY",),
+		"groq": ("GROQ_API_KEY",),
+		"custom": ("CUSTOM_LLM_API_KEY", "EXTERNAL_LLM_API_KEY"),
+	}
+	if selected in provider_vars:
+		for env_name in (*provider_vars[selected], "api_key"):
+			value = os.getenv(env_name, "").strip()
+			if value:
+				return value
+		return ""
+	for env_name in (
+		"api_key", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY",
+		"ANTHROPIC_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY",
+		"GROQ_API_KEY", "CUSTOM_LLM_API_KEY", "EXTERNAL_LLM_API_KEY",
+	):
+		value = os.getenv(env_name, "").strip()
+		if value:
+			return value
+	return ""
+
+
+def get_configured_llm_provider(api_key: str | None = None) -> str:
+	explicit = os.getenv("LLM_PROVIDER", "").strip().lower()
+	aliases = {
+		"gemini": "google",
+		"claude": "anthropic",
+		"openai-compatible": "custom",
+		"openai_compatible": "custom",
+	}
+	explicit = aliases.get(explicit, explicit)
+	if explicit in {"google", "openai", "anthropic", "openrouter", "xai", "groq", "custom"}:
+		return explicit
+	return infer_llm_provider_from_key(api_key)
+
+
+def llm_is_configured() -> bool:
+	provider = get_configured_llm_provider()
+	if provider == "custom":
+		return bool(get_chat_completion_endpoint("custom") and get_custom_llm_model_name())
+	return provider != "missing" and bool(get_llm_api_key())
 
 
 def infer_llm_provider_from_key(api_key: str | None = None) -> str:
@@ -142,7 +216,7 @@ def infer_llm_provider_from_key(api_key: str | None = None) -> str:
 
 def get_llm_config_summary() -> dict:
 	api_key = get_llm_api_key()
-	provider = infer_llm_provider_from_key(api_key)
+	provider = get_configured_llm_provider(api_key)
 	return {
 		"provider": provider,
 		"model": get_llm_model_name(provider),
@@ -163,7 +237,10 @@ def get_llm_config_summary() -> dict:
 		"anthropic_model": get_anthropic_model_name(),
 		"openrouter_endpoint": get_chat_completion_endpoint("openrouter"),
 		"openrouter_model": get_openrouter_model_name(),
+		"custom_endpoint": get_chat_completion_endpoint("custom"),
+		"custom_model": get_custom_llm_model_name(),
 		"has_key": bool(api_key),
+		"configured": llm_is_configured(),
 	}
 
 
@@ -204,9 +281,9 @@ async def gemini_chat(text_array=None, script=None, api_key=None, max_retries=5,
 			actual_language = 'en'
 		elif 'zh' in lang_str or 'cn' in lang_str or lang_str.startswith('zh-'):
 			actual_language = 'zh'
-	
+
 	print(f"[GEMINI] Content language set to: {actual_language}")
-	
+
 	# Language-specific system prompts
 	if actual_language == 'en':
 		system_prompt = '''You are a professional presentation script writer.
@@ -251,7 +328,7 @@ Content to rewrite:'''
 	print(f"[GEMINI] Model: {model_name}")
 
 	# Semaphore: 最多同時 3 個並行請求，防止觸發 429 Rate Limit
-	semaphore = asyncio.Semaphore(3)
+	semaphore = asyncio.Semaphore(_configured_llm_concurrency())
 
 	# ─────────────────────────────────────────────────────────────
 	# 🔑 Step B: 定義單頁非同步處理函式（含快取 + retry）
@@ -275,7 +352,9 @@ Content to rewrite:'''
 					# run_in_executor 讓 blocking 的 generate_content 不阻塞 event loop
 					response = await loop.run_in_executor(
 						None,
-						lambda t=text: model.generate_content(f'{system_prompt} {t}')
+						lambda t=text: _with_llm_request_slot(
+							lambda: model.generate_content(f'{system_prompt} {t}')
+						)
 					)
 					generated_text = remove_markdown(response.text)
 					logger.info("[LLM][Gemini][%s][p%s] raw_len=%s preview=%r", model_name, idx + 1, len(generated_text), generated_text[:180])
@@ -364,7 +443,11 @@ async def chat_completion_llm_chat(text_array=None, language=None, api_key=None,
 	endpoint = get_chat_completion_endpoint(provider)
 	model = get_llm_model_name(provider)
 	timeout_sec = int(os.getenv("EXTERNAL_LLM_TIMEOUT_SEC", "90"))
-	if not api_key:
+	if not endpoint:
+		raise ValueError(f"{provider} LLM endpoint is empty")
+	if not model:
+		raise ValueError(f"{provider} LLM model is empty")
+	if not api_key and provider != "custom":
 		raise ValueError("LLM api_key is empty")
 
 	lang = "en" if str(language or "").lower().startswith("en") else "zh"
@@ -379,25 +462,26 @@ async def chat_completion_llm_chat(text_array=None, language=None, api_key=None,
 			],
 			"temperature": 0.4,
 		}
-		resp = requests.post(
-			endpoint,
-			headers={
-				"Authorization": f"Bearer {api_key}",
-				"Content-Type": "application/json",
-			},
-			json=payload,
-			timeout=timeout_sec,
-		)
+		headers = {"Content-Type": "application/json"}
+		if api_key:
+			headers["Authorization"] = f"Bearer {api_key}"
+		resp = _with_llm_request_slot(lambda: requests.post(
+			endpoint, headers=headers, json=payload, timeout=timeout_sec,
+		))
 		resp.raise_for_status()
 		data = resp.json()
 		return str(data.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
 
 	loop = asyncio.get_event_loop()
-	results = []
-	for t in text_array:
-		content = await loop.run_in_executor(None, lambda x=t: _call_one(x))
-		results.append(remove_markdown(content))
-	return results
+	limit = _configured_llm_concurrency()
+	semaphore = asyncio.Semaphore(limit)
+
+	async def _call_guarded(text: str) -> str:
+		async with semaphore:
+			content = await loop.run_in_executor(None, _call_one, text)
+			return remove_markdown(content)
+
+	return await asyncio.gather(*(_call_guarded(str(t or "")) for t in text_array))
 
 
 async def anthropic_llm_chat(text_array=None, language=None, api_key=None):
@@ -423,16 +507,15 @@ async def anthropic_llm_chat(text_array=None, language=None, api_key=None):
 				{"role": "user", "content": _build_script_prompt(str(text or ""), lang)},
 			],
 		}
-		resp = requests.post(
-			endpoint,
-			headers={
+		resp = _with_llm_request_slot(lambda: requests.post(
+			endpoint, headers={
 				"x-api-key": api_key,
 				"anthropic-version": os.getenv("ANTHROPIC_VERSION", "2023-06-01"),
 				"Content-Type": "application/json",
 			},
 			json=payload,
 			timeout=timeout_sec,
-		)
+		))
 		resp.raise_for_status()
 		data = resp.json()
 		content_blocks = data.get("content", [])
@@ -441,11 +524,15 @@ async def anthropic_llm_chat(text_array=None, language=None, api_key=None):
 		return ""
 
 	loop = asyncio.get_event_loop()
-	results = []
-	for t in text_array:
-		content = await loop.run_in_executor(None, lambda x=t: _call_one(x))
-		results.append(remove_markdown(content))
-	return results
+	limit = _configured_llm_concurrency()
+	semaphore = asyncio.Semaphore(limit)
+
+	async def _call_guarded(text: str) -> str:
+		async with semaphore:
+			content = await loop.run_in_executor(None, _call_one, text)
+			return remove_markdown(content)
+
+	return await asyncio.gather(*(_call_guarded(str(t or "")) for t in text_array))
 
 
 async def external_llm_chat(text_array=None, language=None, api_key=None, provider="openai"):
@@ -464,8 +551,8 @@ async def generate_presentation_scripts(text_array=None, script=None, api_key=No
 	- xai... and gsk_... keys use OpenAI-compatible vendor endpoints.
 	"""
 	api_key = (api_key or get_llm_api_key()).strip()
-	provider = infer_llm_provider_from_key(api_key)
-	if provider in {"openai", "anthropic", "openrouter", "xai", "groq"}:
+	provider = get_configured_llm_provider(api_key)
+	if provider in {"openai", "anthropic", "openrouter", "xai", "groq", "custom"}:
 		return await external_llm_chat(text_array=text_array, language=language, api_key=api_key, provider=provider)
 	if provider == "google":
 		primary = await gemini_chat(text_array=text_array, script=script, api_key=api_key, language=language)
@@ -494,7 +581,7 @@ async def generate_presentation_scripts(text_array=None, script=None, api_key=No
 		return merged
 	if provider == "missing":
 		raise ValueError("LLM api_key is missing")
-	raise ValueError("Unsupported LLM api_key prefix. Use AI.../AQ.... (Google), sk... (OpenAI), sk-ant... (Claude), sk-or-v1... (OpenRouter), xai..., or gsk_...")
+	raise ValueError("Unsupported LLM configuration. Set LLM_PROVIDER explicitly or use a recognized API key prefix.")
 
 
 async def generate_presentation_scripts_from_images(
@@ -542,7 +629,9 @@ async def generate_presentation_scripts_from_images(
 			continue
 		def _call_one(p=path):
 			with Image.open(p) as img:
-				rsp = model.generate_content([prompt, img.convert("RGB")])
+				rsp = _with_llm_request_slot(
+					lambda: model.generate_content([prompt, img.convert("RGB")])
+				)
 				txt = remove_markdown(str(getattr(rsp, "text", "") or "").strip())
 				logger.info("[LLM][GeminiVision][%s][p%s] raw_len=%s preview=%r", model_name, idx + 1, len(txt), txt[:180])
 				return txt
@@ -598,15 +687,14 @@ async def generate_presentation_scripts_from_pdf_file(
 				"temperature": float(temperature),
 			},
 		}
-		resp = requests.post(
-			endpoint,
-			headers={
+		resp = _with_llm_request_slot(lambda: requests.post(
+			endpoint, headers={
 				"Content-Type": "application/json",
 				"x-goog-api-key": api_key,
 			},
 			json=payload,
 			timeout=timeout_sec,
-		)
+		))
 		if not resp.ok:
 			body = resp.text[:2000]
 			logger.error(

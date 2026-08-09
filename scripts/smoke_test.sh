@@ -24,10 +24,6 @@ cleanup() {
   if [[ -n "${RUN_ID}" ]]; then
     curl -fsS -X DELETE "${API_BASE}/api/video-runs/${RUN_ID}" >/dev/null 2>&1 || true
   fi
-  if [[ -n "${PDF_ID}" ]]; then
-    local uploaded_pdf="${PROJECT_ROOT}/backend/app/tmp_pdf/${PDF_ID}.pdf"
-    [[ -f "${uploaded_pdf}" ]] && unlink "${uploaded_pdf}" || true
-  fi
   if [[ -n "${TEMP_DIR}" && "${TEMP_DIR}" == /tmp/slideai-smoke.* ]]; then
     rm -rf "${TEMP_DIR}"
   fi

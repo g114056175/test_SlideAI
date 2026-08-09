@@ -29,6 +29,7 @@ export function useRenderQueue({
   const singleRenderQueue = ref([])
   const activeSingleRenderPage = ref(null)
   const renderingPageStatus = ref({})
+  const activeBatchJobId = ref('')
 
   const cancellableSinglePages = computed(() => {
     const pages = []
@@ -54,6 +55,11 @@ export function useRenderQueue({
     renderStopRequested.value = true
     singleRenderQueue.value = []
     try { currentRenderAbortController?.abort() } catch {}
+    if (currentRunId.value && activeBatchJobId.value) {
+      fetch(getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/jobs/${encodeURIComponent(activeBatchJobId.value)}/cancel`), {
+        method: 'POST',
+      }).catch(() => {})
+    }
   }
 
   const requestStopPage = (pageIdx) => {
@@ -76,6 +82,7 @@ export function useRenderQueue({
     formData.append('speed', String(globalSettings.value.tts.speed))
     formData.append('reference_text', referenceText.value.trim())
     if (cloneAudioFile.value) formData.append('reference_audio', cloneAudioFile.value)
+    if (currentRunId.value) formData.append('response_mode', 'json')
 
     currentRenderAbortController = new AbortController()
     const endpoint = currentRunId.value
@@ -91,6 +98,17 @@ export function useRenderQueue({
       const errData = await res.json().catch(() => ({}))
       throw new Error(errData?.detail || `TTS 生成失敗 (${res.status})`)
     }
+    if (currentRunId.value) {
+      const data = await res.json().catch(() => ({}))
+      const variantId = String(data?.variant_id || data?.tts_id || '')
+      if (!variantId) throw new Error('TTS 已完成，但後端未回傳變體 ID')
+      return {
+        persistent: true,
+        ttsId: String(data?.tts_id || variantId),
+        variantId,
+        audioUrl: String(data?.audio_url || ''),
+      }
+    }
     const audioBlob = await res.blob()
     const audioFile = new File([audioBlob], `page_${slideIdx + 1}_tts.wav`, { type: audioBlob.type || 'audio/wav' })
     audioFile.ttsId = res.headers.get('X-TTS-Id') || ''
@@ -102,7 +120,7 @@ export function useRenderQueue({
     ensureRenderNotStopped()
     const token = localStorage.getItem('token')
     const formData = new FormData()
-    formData.append('audio_file', audioFile)
+    if (audioFile instanceof Blob) formData.append('audio_file', audioFile)
     formData.append('text', String(text || '').trim())
     formData.append('split_min_chars', String(splitMinChars))
     formData.append('split_max_chars', String(splitMaxChars))
@@ -125,6 +143,7 @@ export function useRenderQueue({
       backend: String(data?.backend || ''),
       alignId: String(data?.align_id || res.headers.get('X-Align-Id') || ''),
       variantId: String(data?.variant_id || res.headers.get('X-Variant-Id') || audioFile?.variantId || ''),
+      warning: String(data?.warning || ''),
     }
   }
 
@@ -137,14 +156,17 @@ export function useRenderQueue({
     renderingPageStatus.value = { ...renderingPageStatus.value, [slideIdx]: 'running' }
 
     renderMessage.value = `第 ${slideIdx + 1} 頁：讀取背景圖...`
-    currentRenderAbortController = new AbortController()
-    const imgResp = await fetch(slide.thumbnailUrl, { signal: currentRenderAbortController.signal })
-    const imgBlob = await imgResp.blob()
+    let imgBlob = null
+    if (!currentRunId.value) {
+      currentRenderAbortController = new AbortController()
+      const imgResp = await fetch(slide.thumbnailUrl, { signal: currentRenderAbortController.signal })
+      imgBlob = await imgResp.blob()
+    }
 
     const token = localStorage.getItem('token')
     const formData = new FormData()
-    formData.append('audio_file', audioFile)
-    formData.append('slide_image', imgBlob, `slide_${slideIdx + 1}.png`)
+    if (audioFile instanceof Blob) formData.append('audio_file', audioFile)
+    if (imgBlob) formData.append('slide_image', imgBlob, `slide_${slideIdx + 1}.png`)
     formData.append('segments_json', JSON.stringify(aligned.segments))
     formData.append('subtitle_mode', outputMode)
     formData.append('subtitle_style', 'bg-dark')
@@ -228,7 +250,9 @@ export function useRenderQueue({
         : await alignSubtitleForAudio(audioFile, scriptText, idx)
       if (outputMode !== 'none') renderMessage.value = `第 ${idx + 1} 頁：字幕對齊完成，準備輸出...`
       await renderAssVideoFromPrepared(idx, audioFile, aligned, outputMode)
-      renderMessage.value = `第 ${idx + 1} 頁渲染完成。`
+      renderMessage.value = aligned.warning
+        ? `第 ${idx + 1} 頁渲染完成，但對齊可信度偏低，建議試聽確認。`
+        : `第 ${idx + 1} 頁渲染完成。`
     } catch (err) {
       renderMessage.value = err?.name === 'AbortError' ? `第 ${idx + 1} 頁已終止。` : (err.message || '渲染失敗')
       renderingPageStatus.value = { ...renderingPageStatus.value, [idx]: '' }
@@ -262,6 +286,154 @@ export function useRenderQueue({
     await startSingleRender(idx)
   }
 
+  const regenerateTtsChunk = async ({ variantId, chunkIndex, text }) => {
+    if (!currentRunId.value || !variantId || rendering.value || renderingAll.value) return
+    const pageIdx = selectedSlideIndex.value
+    const scriptText = String(slides.value[pageIdx]?.scriptText || '').trim()
+    rendering.value = true
+    renderStopRequested.value = false
+    renderingPageStatus.value = { ...renderingPageStatus.value, [pageIdx]: 'running' }
+    try {
+      renderMessage.value = `第 ${pageIdx + 1} 頁：重生第 ${Number(chunkIndex) + 1} 段語音...`
+      const formData = new FormData()
+      formData.append('text', String(text || '').trim())
+      const res = await fetch(getApiEndpoint(
+        `/api/video-runs/${encodeURIComponent(currentRunId.value)}/pages/${pageIdx}/variants/${encodeURIComponent(variantId)}/chunks/${Number(chunkIndex)}/regenerate`,
+      ), { method: 'POST', body: formData })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data?.detail || `局部語音重生失敗 (${res.status})`)
+      const nextVariantId = String(data?.variant_id || '')
+      if (!nextVariantId) throw new Error('局部語音重生後未取得變體 ID')
+      const audio = {
+        persistent: true,
+        ttsId: String(data?.tts_id || nextVariantId),
+        variantId: nextVariantId,
+        audioUrl: String(data?.audio_url || ''),
+      }
+      const outputMode = subtitleOutputMode?.value || 'burn'
+      const aligned = outputMode === 'none'
+        ? { segments: [], backend: '', alignId: '', variantId: nextVariantId, warning: '' }
+        : await alignSubtitleForAudio(audio, scriptText, pageIdx)
+      await renderAssVideoFromPrepared(pageIdx, audio, aligned, outputMode)
+      await refreshRunManifest({ applySelected: true })
+      renderMessage.value = aligned.warning
+        ? `第 ${pageIdx + 1} 頁局部重生完成，但對齊可信度偏低，建議試聽。`
+        : `第 ${pageIdx + 1} 頁第 ${Number(chunkIndex) + 1} 段已重生並重新渲染。`
+    } catch (error) {
+      renderMessage.value = error?.message || '局部語音重生失敗'
+    } finally {
+      renderingPageStatus.value = { ...renderingPageStatus.value, [pageIdx]: '' }
+      rendering.value = false
+      currentRenderAbortController = null
+    }
+  }
+
+  const waitForBackendBatchJob = async (jobId, pagesToRender) => {
+    const stageLabels = { queued: '排隊', tts: 'TTS', alignment: '字幕對齊', render: '影片渲染' }
+    while (true) {
+      const res = await fetch(getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/jobs/${encodeURIComponent(jobId)}`))
+      const job = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(job?.detail || `讀取批次任務失敗 (${res.status})`)
+      const pageStates = job?.pages || {}
+      const nextStatus = { ...renderingPageStatus.value }
+      for (const pageIdx of pagesToRender) {
+        const status = pageStates[String(pageIdx)]?.status || ''
+        nextStatus[pageIdx] = status === 'rendered' ? '' : (status ? 'running' : '')
+      }
+      renderingPageStatus.value = nextStatus
+      const stage = String(job?.stage || 'queued')
+      const progress = Number(job?.stage_total || 0)
+        ? ` ${Number(job?.stage_index || 0)}/${Number(job.stage_total)}`
+        : ''
+      const currentPage = Number.isInteger(job?.current_page_index)
+        ? `（第 ${Number(job.current_page_index) + 1} 頁）`
+        : ''
+      const queue = job?.queue || {}
+      if (job?.status === 'queued' || queue?.queue_state === 'queued') {
+        const ahead = Number(queue?.jobs_ahead || 0)
+        const position = Number(queue?.queue_position || 0)
+        const active = queue?.active || null
+        const activeStage = active
+          ? `${stageLabels[String(active.stage || '')] || active.stage || '處理中'}${Number(active.stage_total || 0) ? ` ${Number(active.stage_index || 0)}/${Number(active.stage_total)}` : ''}`
+          : '準備切換任務'
+        renderMessage.value = `正在等待其他任務：前方 ${ahead} 個${position ? `（等待序號 ${position}）` : ''}；目前工作站：${activeStage}。`
+      } else {
+        renderMessage.value = `${stageLabels[stage] || stage}${progress}${currentPage}：後端任務執行中，可重新整理後續跑。`
+      }
+      if (job?.status === 'completed') return job
+      if (job?.status === 'cancelled') throw Object.assign(new Error('批次渲染已終止。'), { name: 'AbortError' })
+      if (job?.status === 'failed') throw new Error(job?.error || '後端批次渲染失敗')
+      await new Promise((resolve) => setTimeout(resolve, 1500))
+    }
+  }
+
+  const renderAllPagesWithBackendJob = async (pagesToRender) => {
+    const outputMode = subtitleOutputMode?.value || 'burn'
+    const res = await fetch(getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/jobs/render`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        page_indexes: pagesToRender,
+        subtitle_mode: outputMode,
+        split_min_chars: splitMinChars,
+        split_max_chars: splitMaxChars,
+        tts_voice: String(globalSettings.value.tts.voice || ''),
+        tts_speed: Number(globalSettings.value.tts.speed || 1),
+        selected_voice_key: String(selectedVoiceKey?.value || ''),
+        reference_text: String(referenceText.value || ''),
+        subtitle_settings: {
+          enable_highlight: Boolean(enableSubtitleHighlight.value),
+          font_size: Number(globalSettings.value.subtitle.fontSize ?? 52),
+          enable_background: Boolean(globalSettings.value.subtitle.enableBackground),
+          bg_color: String(globalSettings.value.subtitle.bgColor || '#000000'),
+          bg_opacity: Number(globalSettings.value.subtitle.bgOpacity || 55),
+          margin_v: Number(globalSettings.value.subtitle.marginV ?? 90),
+        },
+      }),
+    })
+    const job = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(job?.detail || `建立批次任務失敗 (${res.status})`)
+    activeBatchJobId.value = String(job?.job_id || '')
+    if (!activeBatchJobId.value) throw new Error('後端未回傳批次任務 ID')
+    const completed = await waitForBackendBatchJob(activeBatchJobId.value, pagesToRender)
+    await refreshRunManifest({ applySelected: true })
+    const warnings = Object.entries(completed?.pages || {})
+      .filter(([, state]) => state?.warning)
+      .map(([index]) => Number(index) + 1)
+    renderMessage.value = warnings.length
+      ? `全部渲染完成；第 ${warnings.join('、')} 頁對齊可信度偏低，建議試聽確認。`
+      : `全部渲染完成（${pagesToRender.length} 頁）。`
+  }
+
+  const reattachActiveBatchJob = async () => {
+    if (!currentRunId.value || renderingAll.value) return false
+    const res = await fetch(getApiEndpoint(
+      `/api/video-runs/${encodeURIComponent(currentRunId.value)}/jobs-current`,
+    ))
+    if (res.status === 204) return false
+    const job = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(job?.detail || `讀取進行中任務失敗 (${res.status})`)
+    const jobId = String(job?.job_id || '')
+    if (!jobId) return false
+    const requested = Array.isArray(job?.payload?.page_indexes)
+      ? job.payload.page_indexes.map(Number).filter(Number.isInteger)
+      : renderablePageIndexes.value
+    activeBatchJobId.value = jobId
+    renderingAll.value = true
+    renderStopRequested.value = false
+    try {
+      await waitForBackendBatchJob(jobId, requested)
+      await refreshRunManifest({ applySelected: true })
+      renderMessage.value = `已接續並完成批次渲染（${requested.length} 頁）。`
+    } catch (error) {
+      if (error?.name !== 'AbortError') renderMessage.value = error?.message || '批次渲染失敗'
+    } finally {
+      activeBatchJobId.value = ''
+      renderingAll.value = false
+    }
+    return true
+  }
+
   const renderAllPages = async () => {
     if (!slides.value.length) return
     const pagesToRender = renderablePageIndexes.value
@@ -290,39 +462,105 @@ export function useRenderQueue({
     const skipped = slides.value.length - pagesToRender.length
     renderMessage.value = skipped ? `開始批次渲染：${pagesToRender.length} 頁，跳過 ${skipped} 頁空講稿。` : '開始批次渲染...'
     const total = pagesToRender.length
+    const outputMode = subtitleOutputMode?.value || 'burn'
+    const preparedAudio = new Map()
+    const preparedAlignment = new Map()
+    const alignmentWarnings = []
+
+    const markOnlyCurrentPageRunning = (pageIdx = null) => {
+      const next = { ...renderingPageStatus.value }
+      for (const idx of pagesToRender) {
+        if (next[idx] === 'running') next[idx] = ''
+      }
+      if (Number.isInteger(pageIdx)) next[pageIdx] = 'running'
+      renderingPageStatus.value = next
+    }
+
     try {
+      if (currentRunId.value) {
+        await renderAllPagesWithBackendJob(pagesToRender)
+        return
+      }
+      // Keep one GPU model resident for a whole batch.  The previous page-wise
+      // TTS -> alignment -> render loop repeatedly unloaded Nano VoxCPM and the
+      // Qwen aligner.  Running the batch in stages preserves the same peak-VRAM
+      // behaviour while reducing model transitions from roughly 2 * pages to 2.
+      renderMessage.value = `TTS 階段 0/${total}：準備語音模型...`
       for (let n = 0; n < total; n += 1) {
         ensureRenderNotStopped()
         const i = pagesToRender[n]
         const s = String(slides.value[i]?.scriptText || '').trim()
-        renderingPageStatus.value = { ...renderingPageStatus.value, [i]: 'running' }
-        renderMessage.value = `TTS ${n + 1}/${total}（第 ${i + 1} 頁）`
+        markOnlyCurrentPageRunning(i)
+        renderMessage.value = `TTS 階段 ${n + 1}/${total}（第 ${i + 1} 頁）`
         const audioFile = await createAudioFromTtsPreview(s, i)
-        ensureRenderNotStopped()
-        const outputMode = subtitleOutputMode?.value || 'burn'
-        const aligned = outputMode === 'none'
-          ? { segments: [], backend: '', alignId: '', variantId: String(audioFile?.variantId || '') }
-          : await alignSubtitleForAudio(audioFile, s, i)
-        ensureRenderNotStopped()
-        selectedSlideIndex.value = i
-        renderMessage.value = `${outputMode === 'burn' ? 'ASS 字幕渲染' : '無字幕影片輸出'} ${n + 1}/${total}（第 ${i + 1} 頁）`
-        await renderAssVideoFromPrepared(i, audioFile, aligned, outputMode)
+        preparedAudio.set(i, audioFile)
       }
-      renderMessage.value = skipped ? `全部渲染完成（${total} 頁，跳過 ${skipped} 頁空講稿）` : `全部渲染完成（${total} 頁）`
+
+      markOnlyCurrentPageRunning()
+      if (outputMode !== 'none') {
+        renderMessage.value = `字幕對齊階段 0/${total}：切換強制對齊模型...`
+        for (let n = 0; n < total; n += 1) {
+          ensureRenderNotStopped()
+          const i = pagesToRender[n]
+          const s = String(slides.value[i]?.scriptText || '').trim()
+          const audioFile = preparedAudio.get(i)
+          if (!audioFile) throw new Error(`第 ${i + 1} 頁缺少已生成音訊`)
+          markOnlyCurrentPageRunning(i)
+          renderMessage.value = `字幕對齊階段 ${n + 1}/${total}（第 ${i + 1} 頁）`
+          const aligned = await alignSubtitleForAudio(audioFile, s, i)
+          preparedAlignment.set(i, aligned)
+          if (aligned.warning) alignmentWarnings.push(i)
+        }
+      } else {
+        for (const i of pagesToRender) {
+          const audioFile = preparedAudio.get(i)
+          preparedAlignment.set(i, {
+            segments: [],
+            backend: '',
+            alignId: '',
+            variantId: String(audioFile?.variantId || ''),
+          })
+        }
+      }
+
+      markOnlyCurrentPageRunning()
+      for (let n = 0; n < total; n += 1) {
+        ensureRenderNotStopped()
+        const i = pagesToRender[n]
+        const audioFile = preparedAudio.get(i)
+        const aligned = preparedAlignment.get(i)
+        if (!audioFile || !aligned) throw new Error(`第 ${i + 1} 頁缺少批次渲染資料`)
+        selectedSlideIndex.value = i
+        const outputLabel = outputMode === 'burn'
+          ? 'ASS 字幕渲染'
+          : (outputMode === 'sidecar' ? 'SRT 影片輸出' : '無字幕影片輸出')
+        renderMessage.value = `${outputLabel}階段 ${n + 1}/${total}（第 ${i + 1} 頁）`
+        await renderAssVideoFromPrepared(i, audioFile, aligned, outputMode)
+        preparedAudio.delete(i)
+        preparedAlignment.delete(i)
+      }
+      const warningSuffix = alignmentWarnings.length
+        ? `；第 ${alignmentWarnings.map((i) => i + 1).join('、')} 頁對齊可信度偏低，建議試聽確認`
+        : ''
+      renderMessage.value = (skipped ? `全部渲染完成（${total} 頁，跳過 ${skipped} 頁空講稿）` : `全部渲染完成（${total} 頁）`) + warningSuffix
     } catch (err) {
       renderMessage.value = err?.name === 'AbortError' ? '批次渲染已終止。' : (err.message || '全部渲染失敗')
       Object.keys(renderingPageStatus.value || {}).forEach((k) => {
         if (renderingPageStatus.value[k] === 'running') renderingPageStatus.value[k] = ''
       })
     } finally {
+      preparedAudio.clear()
+      preparedAlignment.clear()
       currentRenderAbortController = null
+      activeBatchJobId.value = ''
       renderingAll.value = false
       if (singleRenderQueue.value.length) await processSingleRenderQueue()
     }
   }
 
-  const mergeAndDownloadRenderedVideos = async () => {
-    const ok = window.confirm('將依目前頁序合併已渲染影片（未渲染頁會跳過），並直接下載。確定執行？')
+  const mergeAndDownloadRenderedVideos = async (transitionsEnabled = false) => {
+    const transitionLabel = transitionsEnabled ? '，並加入系統隨機轉場' : ''
+    const ok = window.confirm(`將依目前頁序合併已渲染影片${transitionLabel}（未渲染頁會跳過），並直接下載。確定執行？`)
     if (!ok) return
     const pageIndexes = slides.value.map((_, i) => i).filter((i) => !!renderedPageVideos.value[i])
     if (!pageIndexes.length) {
@@ -332,6 +570,7 @@ export function useRenderQueue({
     try {
       renderMessage.value = `合併匯出中（${pageIndexes.length} 段）...`
       const formData = new FormData()
+      formData.append('transitions_enabled', transitionsEnabled ? 'true' : 'false')
       let mergeUrl = getApiEndpoint('/api/video-abstract/merge-rendered-videos')
       if (currentRunId.value) {
         mergeUrl = getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/exports/merge-selected`)
@@ -381,12 +620,15 @@ export function useRenderQueue({
     singleRenderQueue,
     activeSingleRenderPage,
     renderingPageStatus,
+    activeBatchJobId,
     cancellableSinglePages,
     renderablePageIndexes,
     requestStopAllRendering,
     requestStopPage,
     renderCurrentPage,
     renderAllPages,
+    reattachActiveBatchJob,
+    regenerateTtsChunk,
     mergeAndDownloadRenderedVideos,
   }
 }

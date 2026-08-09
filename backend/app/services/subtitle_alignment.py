@@ -23,6 +23,7 @@ from backend.app.services.alignment.time_mapper import (
 from backend.app.services.alignment.repair import (
     make_repair_plan,
     map_repaired_spans_to_source,
+    validate_repaired_spans,
 )
 from backend.app.services.alignment.sentence_splitter import (
     _ASCII_WORD_RE,
@@ -172,6 +173,7 @@ class AlignmentResult:
     warning: str = ""
     readable_chunks: List[str] = None
     source_text: str = ""
+    match_ratio: float = 1.0
 
 _OPENCC_T2S = None
 _OPENCC_S2T = None
@@ -289,7 +291,7 @@ def _normalize_split_limits(min_chars: int, max_chars: int) -> Tuple[int, int]:
 
 def _tokenize_display_units(text: str) -> List[str]:
     """Tokenize text into display units for word-level highlighting.
-    Groups punctuation and spaces with adjacent speech tokens so they 
+    Groups punctuation and spaces with adjacent speech tokens so they
     are preserved in the frontend display.
     """
     src = str(text or "")
@@ -358,13 +360,13 @@ def _tokenize_display_units(text: str) -> List[str]:
         else:
             prefix += ch
         i += 1
-        
+
     if prefix and tokens:
         tokens[-1] += prefix
     elif prefix and not tokens:
         # If it's ONLY punctuation (edge case)
         tokens.append(prefix)
-        
+
     return tokens
 
 
@@ -670,7 +672,8 @@ def _expand_units_to_char_spans(units: List[Dict[str, Any]]) -> Tuple[str, List[
 def align_subtitles_from_audio_and_text(
     *,
     text: str,
-    audio_bytes: bytes,
+    audio_bytes: bytes | None = None,
+    audio_source_path: str | None = None,
     audio_filename: str = "input.wav",
     language: str = "auto",
     alignment_mode: str = "auto",
@@ -688,7 +691,7 @@ def align_subtitles_from_audio_and_text(
     if mode == "scripted" and not ref_clean:
         # Fallback to ASR flow when callers keep scripted but send empty text.
         mode = "auto_asr"
-    if not audio_bytes:
+    if not audio_bytes and not audio_source_path:
         raise ValueError("audio file is empty")
 
     language_name = _normalize_language_name(language)
@@ -708,10 +711,17 @@ def align_subtitles_from_audio_and_text(
     if not os.path.isfile(runtime_python):
         raise RuntimeError(f"runtime python not found: {runtime_python}")
 
-    suffix = os.path.splitext(audio_filename or "")[-1] or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as fp:
-        fp.write(audio_bytes)
-        audio_path = fp.name
+    owns_audio_path = False
+    if audio_source_path:
+        audio_path = str(Path(audio_source_path).expanduser().resolve())
+        if not os.path.isfile(audio_path):
+            raise FileNotFoundError(f"audio file not found: {audio_path}")
+    else:
+        suffix = os.path.splitext(audio_filename or "")[-1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as fp:
+            fp.write(audio_bytes or b"")
+            audio_path = fp.name
+        owns_audio_path = True
 
     try:
         hf_token = (os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or "").strip() or None
@@ -816,7 +826,11 @@ def align_subtitles_from_audio_and_text(
             # "900px" or "1.23GB".  The display text stays unchanged, but a
             # second forced-alignment pass may use a spoken form
             # ("九百pixel") and map its timing back to the original text.
-            repair_plan = make_repair_plan(source_text, units)
+            repair_plan = make_repair_plan(
+                source_text,
+                units,
+                language=language_name,
+            )
             if repair_plan.enabled and repair_plan.repaired_text and repair_plan.char_map:
                 try:
                     repaired_words, repaired_backend, _ = _run_word_timestamp_worker(
@@ -838,18 +852,48 @@ def align_subtitles_from_audio_and_text(
                         if e <= s:
                             e = s + 1e-3
                         repaired_units.append({"text": txt, "start": s, "end": e})
-                    _, repaired_char_spans = _expand_units_to_char_spans(repaired_units)
+                    repaired_clean_text, repaired_char_spans = _expand_units_to_char_spans(repaired_units)
                     mapped_spans = map_repaired_spans_to_source(
                         source_text,
                         repaired_char_spans,
                         repair_plan.char_map,
                     )
-                    if len(mapped_spans) == len(_align_clean(source_text)):
+                    repaired_target_clean = _align_clean(repair_plan.repaired_text).lower()
+                    repaired_actual_clean = _align_clean(repaired_clean_text).lower()
+                    repaired_match_ratio = difflib.SequenceMatcher(
+                        None,
+                        repaired_target_clean,
+                        repaired_actual_clean,
+                    ).ratio()
+                    valid_repair, repair_quality_reason = validate_repaired_spans(
+                        source_text,
+                        mapped_spans,
+                        audio_end=max(
+                            audio_end,
+                            max((float(u.get("end") or 0.0) for u in repaired_units), default=0.0),
+                        ),
+                        text_match_ratio=repaired_match_ratio,
+                    )
+                    if valid_repair:
                         repaired_ref_char_spans = mapped_spans
                         backend = f"{backend}+repair"
-                        repair_warning = f"已對數字/單位異常時間軸啟用二次強對齊修正（{repaired_backend}）。"
+                        logger.info(
+                            "[SubtitleAlign] numeric/unit timing repair applied backend=%s",
+                            repaired_backend,
+                        )
+                    else:
+                        logger.warning(
+                            "[SubtitleAlign] rejected numeric repair: reason=%s match=%.3f",
+                            repair_quality_reason,
+                            repaired_match_ratio,
+                        )
+                        # The original alignment remains usable. Keep this in
+                        # logs instead of interrupting the normal TTS workflow.
                 except Exception as exc:
-                    repair_warning = f"數字/單位二次強對齊修正失敗，已保留原時間軸：{exc}"
+                    logger.warning(
+                        "[SubtitleAlign] numeric/unit repair failed; original timing kept: %s",
+                        exc,
+                    )
 
         readable_chunks = _split_for_readability(source_text, min_chars=min_chars, max_chars=max_chars)
         if not readable_chunks:
@@ -894,10 +938,10 @@ def align_subtitles_from_audio_and_text(
             )
             from fastapi import HTTPException as _HTTPException
             raise _HTTPException(status_code=422, detail=detail)
-        elif match_ratio < 0.55:
+        elif match_ratio < 0.40:
             warning_msg = (
-                f"⚠️ 系統提示：講稿與音頻的對應程度偏低（相似度 {match_ratio*100:.0f}%），"
-                f"字幕時間軸可能有部分落差。建議確認講稿文字是否完全對應此音頻。"
+                f"講稿與音訊的對應程度很低（相似度 {match_ratio*100:.0f}%），"
+                f"字幕時間軸可能有明顯落差，建議確認音訊是否對應本頁講稿。"
             )
         if repair_warning:
             warning_msg = f"{warning_msg}\n{repair_warning}".strip()
@@ -1004,7 +1048,7 @@ def align_subtitles_from_audio_and_text(
                     swt = re.sub(r'([\u3400-\u9fff])([A-Za-z0-9])', r'\1 \2', wt)
                     swt = re.sub(r'([A-Za-z0-9])([\u3400-\u9fff])', r'\1 \2', swt)
                     w["text"] = swt
-                
+
                 seg["start"] = float(words[0].get("start", seg["start"]))
                 seg["end"] = max(seg["start"], float(words[-1].get("end", seg["end"])))
             else:
@@ -1026,9 +1070,11 @@ def align_subtitles_from_audio_and_text(
             warning=warning_msg,
             readable_chunks=readable_chunks,
             source_text=source_text,
+            match_ratio=float(match_ratio),
         )
     finally:
-        try:
-            os.remove(audio_path)
-        except Exception:
-            pass
+        if owns_audio_path:
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass

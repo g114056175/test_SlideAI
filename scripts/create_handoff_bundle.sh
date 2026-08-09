@@ -60,7 +60,6 @@ RSYNC_EXCLUDES=(
   "--exclude=.frontend5174.pid"
   "--exclude=**/__pycache__"
   "--exclude=backend/app/services/*.bak.*"
-  "--exclude=backend/app/tmp_pdf"
   "--exclude=backend/app/user_thumbnails"
   "--exclude=backend/.venv"
   "--exclude=.runtimes"

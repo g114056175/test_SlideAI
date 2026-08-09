@@ -33,6 +33,11 @@ export function useVideoRuns({
     return getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/pages/${pageIdx}/variants/${encodeURIComponent(variantId)}/subtitles.srt`)
   }
 
+  const variantBundleUrl = (pageIdx, variantId) => {
+    if (!currentRunId.value || !variantId) return ''
+    return getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/pages/${pageIdx}/variants/${encodeURIComponent(variantId)}/download.zip`)
+  }
+
   const exportVideoUrl = (variantId) => {
     if (!currentRunId.value || !variantId) return ''
     return getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/exports/${encodeURIComponent(variantId)}/video`)
@@ -41,6 +46,11 @@ export function useVideoRuns({
   const exportSrtUrl = (variantId) => {
     if (!currentRunId.value || !variantId) return ''
     return getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/exports/${encodeURIComponent(variantId)}/subtitles.srt`)
+  }
+
+  const exportBundleUrl = (variantId) => {
+    if (!currentRunId.value || !variantId) return ''
+    return getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/exports/${encodeURIComponent(variantId)}/download.zip`)
   }
 
   const refreshRunManifest = async ({ applySelected = false } = {}) => {
@@ -157,8 +167,10 @@ export function useVideoRuns({
     selectedExportVariantId,
     variantVideoUrl,
     variantSrtUrl,
+    variantBundleUrl,
     exportVideoUrl,
     exportSrtUrl,
+    exportBundleUrl,
     refreshRunManifest,
     selectPageVariant,
     deletePageVariant,

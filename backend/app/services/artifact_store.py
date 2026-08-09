@@ -5,13 +5,19 @@ import os
 import shutil
 import uuid
 import hashlib
+import fcntl
+import inspect
+import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _safe_name(value: str, fallback: str = "untitled") -> str:
@@ -37,6 +43,22 @@ def get_video_runs_root() -> Path:
     return (_repo_root() / "data" / "video_runs").resolve()
 
 
+def _locked_run_mutation(method):
+    """Serialize one complete read/modify/write operation for a video run."""
+    signature = inspect.signature(method)
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        run_id = str(bound.arguments.get("run_id") or "").strip()
+        if not run_id:
+            return method(self, *args, **kwargs)
+        with self.run_lock(run_id):
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class VideoRunStore:
     """Filesystem-backed artifact store for PDF-to-video runs.
 
@@ -48,6 +70,25 @@ class VideoRunStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = (root or get_video_runs_root()).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._locks_root = self.root / ".locks"
+        self._locks_root.mkdir(parents=True, exist_ok=True)
+        self._thread_locks_guard = threading.Lock()
+        self._thread_locks: Dict[str, threading.RLock] = {}
+
+    @contextmanager
+    def run_lock(self, run_id: str):
+        """Lock a run across both threads and backend processes on Linux."""
+        safe_run_id = _safe_name(run_id, "run")
+        with self._thread_locks_guard:
+            thread_lock = self._thread_locks.setdefault(safe_run_id, threading.RLock())
+        with thread_lock:
+            lock_path = self._locks_root / f"{safe_run_id}.lock"
+            with lock_path.open("a+b") as lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def new_run_id(self) -> str:
         return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -146,12 +187,33 @@ class VideoRunStore:
                 break
         return out
 
+    def find_manifest_by_pdf_id(self, pdf_id: str) -> Optional[Dict[str, Any]]:
+        """Return the newest persistent run that owns a legacy PDF id."""
+        wanted = str(pdf_id or "").strip()
+        if not wanted:
+            return None
+        manifests = sorted(
+            self.root.glob("*/manifest.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in manifests:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if str(data.get("pdf_id") or "").strip() == wanted:
+                return data
+        return None
+
+    @_locked_run_mutation
     def delete_run(self, run_id: str) -> None:
         rdir = self.run_dir(run_id)
         if not rdir.is_dir() or not (rdir / "manifest.json").is_file():
             raise FileNotFoundError(f"run not found: {run_id}")
         shutil.rmtree(rdir)
 
+    @_locked_run_mutation
     def rename_run(self, run_id: str, display_name: str) -> Dict[str, Any]:
         manifest = self.load_manifest(run_id)
         name = str(display_name or "").strip()
@@ -161,6 +223,7 @@ class VideoRunStore:
         self.save_manifest(manifest)
         return manifest
 
+    @_locked_run_mutation
     def update_page_scripts(self, run_id: str, scripts: Iterable[str]) -> Dict[str, Any]:
         """Persist the editable page scripts in the run manifest.
 
@@ -186,6 +249,7 @@ class VideoRunStore:
         self._write_json(self.run_dir(run_id) / "scripts.json", {"scripts": [p.get("script", "") for p in pages]})
         return manifest
 
+    @_locked_run_mutation
     def update_settings(
         self,
         run_id: str,
@@ -228,6 +292,7 @@ class VideoRunStore:
     def page_dir(self, run_id: str, page_index: int) -> Path:
         return self.run_dir(run_id) / "pages" / f"page_{page_index + 1:03d}"
 
+    @_locked_run_mutation
     def record_page_asset(
         self,
         *,
@@ -257,6 +322,7 @@ class VideoRunStore:
         self.save_manifest(manifest)
         return page
 
+    @_locked_run_mutation
     def record_page_tts(
         self,
         *,
@@ -287,6 +353,7 @@ class VideoRunStore:
         self.save_manifest(manifest)
         return item
 
+    @_locked_run_mutation
     def record_page_alignment(
         self,
         *,
@@ -360,12 +427,14 @@ class VideoRunStore:
         page["selected_variant_id"] = variant_id
         return variant
 
+    @_locked_run_mutation
     def record_page_variant_tts(
         self,
         *,
         run_id: str,
         page_index: int,
-        audio_bytes: bytes,
+        audio_bytes: bytes | None = None,
+        audio_source_path: str | Path | None = None,
         metadata: Optional[Dict[str, Any]] = None,
         label: str = "",
     ) -> Dict[str, Any]:
@@ -380,16 +449,43 @@ class VideoRunStore:
         vdir = self._variant_dir(run_id, page_index, variant["variant_id"])
         vdir.mkdir(parents=True, exist_ok=True)
         audio_path = vdir / "audio.wav"
-        audio_path.write_bytes(audio_bytes)
+        if audio_source_path is not None:
+            source_path = Path(audio_source_path).resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(f"generated audio not found: {source_path}")
+            if source_path != audio_path.resolve():
+                shutil.copy2(source_path, audio_path)
+        elif audio_bytes is not None:
+            audio_path.write_bytes(audio_bytes)
+        else:
+            raise ValueError("audio_bytes or audio_source_path is required")
+        chunks_payload: Dict[str, Any] = {}
+        if audio_source_path is not None:
+            source_chunks_dir = Path(audio_source_path).with_suffix(".chunks")
+            source_chunks_json = source_chunks_dir / "chunks.json"
+            if source_chunks_json.is_file():
+                chunks_dir = vdir / "chunks"
+                shutil.copytree(source_chunks_dir, chunks_dir, dirs_exist_ok=True)
+                try:
+                    chunks_payload = json.loads((chunks_dir / "chunks.json").read_text(encoding="utf-8"))
+                except Exception:
+                    chunks_payload = {}
+                for chunk in chunks_payload.get("chunks") or []:
+                    filename = _safe_name(str(chunk.get("filename") or ""), "chunk.wav")
+                    chunk["path"] = str(chunks_dir / filename)
         tts_json = {
             "variant_id": variant["variant_id"],
             "created_at": _utc_now(),
             "status": "ready",
             "metadata": metadata or {},
             "paths": {"audio": str(audio_path)},
+            "chunks": chunks_payload.get("chunks") or [],
+            "chunk_silence_ms": float(chunks_payload.get("silence_ms") or 0.0),
         }
         self._write_json(vdir / "tts.json", tts_json)
         variant.setdefault("paths", {})["audio"] = str(audio_path)
+        if chunks_payload:
+            variant.setdefault("paths", {})["chunks"] = str(vdir / "chunks")
         variant["tts"] = tts_json
         variant["updated_at"] = _utc_now()
         manifest["status"] = "rendering"
@@ -397,6 +493,7 @@ class VideoRunStore:
         self._write_json(vdir / "variant.json", variant)
         return variant
 
+    @_locked_run_mutation
     def record_page_variant_alignment(
         self,
         *,
@@ -436,12 +533,14 @@ class VideoRunStore:
         self._write_json(vdir / "variant.json", variant)
         return variant
 
+    @_locked_run_mutation
     def record_page_variant(
         self,
         *,
         run_id: str,
         page_index: int,
-        video_bytes: bytes,
+        video_bytes: bytes | None = None,
+        video_source_path: str | Path | None = None,
         audio_bytes: bytes | None = None,
         slide_bytes: bytes | None = None,
         segments: Optional[List[Dict[str, Any]]] = None,
@@ -467,7 +566,16 @@ class VideoRunStore:
 
         paths: Dict[str, str] = dict(variant.get("paths") or {})
         video_path = vdir / "video.mp4"
-        video_path.write_bytes(video_bytes)
+        if video_source_path is not None:
+            source_path = Path(video_source_path).resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(f"rendered video not found: {source_path}")
+            if source_path != video_path.resolve():
+                shutil.copy2(source_path, video_path)
+        elif video_bytes is not None:
+            video_path.write_bytes(video_bytes)
+        else:
+            raise ValueError("video_bytes or video_source_path is required")
         paths["video"] = str(video_path)
         if audio_bytes is not None:
             audio_path = vdir / "audio.wav"
@@ -507,6 +615,7 @@ class VideoRunStore:
         self._write_json(vdir / "variant.json", variant)
         return variant
 
+    @_locked_run_mutation
     def select_page_variant(self, *, run_id: str, page_index: int, variant_id: str) -> Dict[str, Any]:
         manifest = self.load_manifest(run_id)
         pages = manifest.get("pages") or []
@@ -519,6 +628,7 @@ class VideoRunStore:
         self.save_manifest(manifest)
         return pages[page_index]
 
+    @_locked_run_mutation
     def delete_page_variant(self, *, run_id: str, page_index: int, variant_id: str) -> Dict[str, Any]:
         manifest = self.load_manifest(run_id)
         pages = manifest.get("pages") or []
@@ -558,6 +668,39 @@ class VideoRunStore:
                 break
         raise FileNotFoundError(f"variant video not found: {variant_id}")
 
+    def get_variant_audio_path(self, *, run_id: str, page_index: int, variant_id: str) -> Path:
+        manifest = self.load_manifest(run_id)
+        pages = manifest.get("pages") or []
+        if page_index < 0 or page_index >= len(pages):
+            raise IndexError("page index out of range")
+        for variant in pages[page_index].get("variants") or []:
+            if variant.get("variant_id") == variant_id:
+                path = Path(str((variant.get("paths") or {}).get("audio") or ""))
+                if path.is_file():
+                    return path
+                break
+        raise FileNotFoundError(f"variant audio not found: {variant_id}")
+
+    def get_page_variant(self, *, run_id: str, page_index: int, variant_id: str) -> Dict[str, Any]:
+        manifest = self.load_manifest(run_id)
+        pages = manifest.get("pages") or []
+        if page_index < 0 or page_index >= len(pages):
+            raise IndexError("page index out of range")
+        variant = self._find_variant(pages[page_index], variant_id)
+        if variant is None:
+            raise FileNotFoundError(f"variant not found: {variant_id}")
+        return variant
+
+    def get_page_slide_path(self, *, run_id: str, page_index: int) -> Path:
+        manifest = self.load_manifest(run_id)
+        pages = manifest.get("pages") or []
+        if page_index < 0 or page_index >= len(pages):
+            raise IndexError("page index out of range")
+        path = Path(str((pages[page_index].get("paths") or {}).get("slide") or ""))
+        if path.is_file():
+            return path
+        raise FileNotFoundError(f"page slide not found: {page_index}")
+
     def get_variant_srt_path(self, *, run_id: str, page_index: int, variant_id: str) -> Path:
         manifest = self.load_manifest(run_id)
         pages = manifest.get("pages") or []
@@ -571,11 +714,13 @@ class VideoRunStore:
                 break
         raise FileNotFoundError(f"variant SRT not found: {variant_id}")
 
+    @_locked_run_mutation
     def record_export_variant(
         self,
         *,
         run_id: str,
-        video_bytes: bytes,
+        video_bytes: bytes | None = None,
+        video_source_path: str | Path | None = None,
         source_pages: Optional[List[int]] = None,
         settings: Optional[Dict[str, Any]] = None,
         label: str = "",
@@ -589,7 +734,16 @@ class VideoRunStore:
         vdir.mkdir(parents=True, exist_ok=True)
 
         video_path = vdir / "video.mp4"
-        video_path.write_bytes(video_bytes)
+        if video_source_path is not None:
+            source_path = Path(video_source_path).resolve()
+            if not source_path.is_file():
+                raise FileNotFoundError(f"merged video not found: {source_path}")
+            if source_path != video_path.resolve():
+                shutil.copy2(source_path, video_path)
+        elif video_bytes is not None:
+            video_path.write_bytes(video_bytes)
+        else:
+            raise ValueError("video_bytes or video_source_path is required")
         paths = {"video": str(video_path)}
         if srt_content:
             srt_path = vdir / "subtitles.srt"
@@ -610,6 +764,7 @@ class VideoRunStore:
         self._write_json(vdir / "variant.json", variant)
         return variant
 
+    @_locked_run_mutation
     def select_export_variant(self, *, run_id: str, variant_id: str) -> Dict[str, Any]:
         manifest = self.load_manifest(run_id)
         exports = manifest.setdefault("exports", {})
@@ -620,6 +775,7 @@ class VideoRunStore:
         self.save_manifest(manifest)
         return exports
 
+    @_locked_run_mutation
     def delete_export_variant(self, *, run_id: str, variant_id: str) -> Dict[str, Any]:
         manifest = self.load_manifest(run_id)
         exports = manifest.setdefault("exports", {})
@@ -659,6 +815,88 @@ class VideoRunStore:
                 break
         raise FileNotFoundError(f"export SRT not found: {variant_id}")
 
+    @_locked_run_mutation
+    def create_job(self, *, run_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.manifest_path(run_id).is_file():
+            raise FileNotFoundError(f"run not found: {run_id}")
+        job_id = f"job-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        job = {
+            "job_id": job_id,
+            "run_id": run_id,
+            "status": "queued",
+            "stage": "queued",
+            "cancel_requested": False,
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "payload": payload,
+            "pages": {},
+            "error": "",
+        }
+        self._write_json(self.run_dir(run_id) / "jobs" / f"{job_id}.json", job)
+        return job
+
+    def load_job(self, *, run_id: str, job_id: str) -> Dict[str, Any]:
+        path = self.run_dir(run_id) / "jobs" / f"{_safe_name(job_id, 'job')}.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"job not found: {job_id}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @_locked_run_mutation
+    def update_job(self, *, run_id: str, job_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        job = self.load_job(run_id=run_id, job_id=job_id)
+        for key, value in (updates or {}).items():
+            if key == "pages" and isinstance(value, dict):
+                pages = dict(job.get("pages") or {})
+                pages.update(value)
+                job["pages"] = pages
+            else:
+                job[key] = value
+        job["updated_at"] = _utc_now()
+        self._write_json(self.run_dir(run_id) / "jobs" / f"{_safe_name(job_id, 'job')}.json", job)
+        return job
+
+    def list_jobs(self, *, run_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        jobs_dir = self.run_dir(run_id) / "jobs"
+        jobs = []
+        for path in sorted(jobs_dir.glob("job-*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                jobs.append(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+            if len(jobs) >= limit:
+                break
+        return jobs
+
+    def list_all_jobs(
+        self,
+        *,
+        statuses: Optional[Iterable[str]] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """List jobs across runs in durable FIFO order.
+
+
+        The backend is intentionally a single-process local service.  Job JSON
+        files provide restart recovery without introducing a database solely
+        for the GPU queue.
+        """
+        wanted = {str(value) for value in (statuses or []) if str(value)}
+        rows: List[tuple[str, int, Dict[str, Any]]] = []
+        for path in self.root.glob("*/jobs/job-*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if wanted and str(payload.get("status") or "") not in wanted:
+                    continue
+                rows.append((
+                    str(payload.get("created_at") or ""),
+                    path.stat().st_mtime_ns,
+                    payload,
+                ))
+            except Exception:
+                continue
+        rows.sort(key=lambda row: (row[0], row[1], str(row[2].get("job_id") or "")))
+        return [row[2] for row in rows[:max(1, int(limit))]]
+
     def _summary(self, manifest: Dict[str, Any]) -> Dict[str, Any]:
         pages = manifest.get("pages") or []
         rendered = sum(1 for p in pages if p.get("variants"))
@@ -680,9 +918,24 @@ class VideoRunStore:
     @staticmethod
     def _write_json(path: Path, data: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=path.parent,
+                delete=False,
+            ) as tmp:
+                json.dump(data, tmp, ensure_ascii=False, indent=2)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                tmp_path = Path(tmp.name)
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
 
 _STORE: VideoRunStore | None = None

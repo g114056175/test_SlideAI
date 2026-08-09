@@ -10,7 +10,8 @@ from sqlalchemy import create_engine, Column, Integer, String, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from passlib.context import CryptContext
-from jose import jwt, JWTError, ExpiredSignatureError
+import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError as JWTError
 import os
 import secrets
 from dotenv import load_dotenv
@@ -130,6 +131,15 @@ def check_poppler_available():
         )
         # Fail fast so the container won't start in a broken state
         raise RuntimeError("pdftoppm (poppler) not found on startup")
+
+
+@app.on_event("startup")
+async def recover_video_batch_queue():
+    """Resume durable FIFO jobs after a backend restart."""
+    logger = logging.getLogger("slideai.batch")
+    recovered = video.recover_persistent_batch_jobs()
+    if recovered:
+        logger.info("Recovered %s queued/interrupted batch render job(s)", recovered)
 
 class RegisterRequest(BaseModel):
     email: EmailStr

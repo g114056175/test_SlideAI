@@ -118,7 +118,7 @@ for (const st of states) {
   await page.waitForFunction(() => window.__DOM_UPDATED === true);
 
   const statePath = path.join(stateDir, `state_${String(stateIdx).padStart(6, '0')}.png`);
-  
+
   // Screenshot only the bottom strip with omitBackground to preserve transparency
   await page.screenshot({
     path: statePath,

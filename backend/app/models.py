@@ -10,10 +10,10 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)  # 統一名稱
-    is_admin = Column(Boolean, default=False, index=True)      
+    is_admin = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     reset_token = Column(String, nullable=True, index=True)  # 新增重設密碼token欄位
-    
+
     # 關聯到使用記錄、檔案和專案
     usage_records = relationship("UsageRecord", back_populates="user")
     files = relationship("UserFile", back_populates="user")
@@ -26,7 +26,7 @@ class UsageRecord(Base):
     usage_date = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     service_type = Column(String, nullable=False, index=True)  # 'video_abstract' 或 'ppt_to_video'
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    
+
     # 關聯到使用者
     user = relationship("User", back_populates="usage_records")
 
@@ -42,7 +42,7 @@ class UserFile(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     expires_at = Column(DateTime, nullable=False, index=True)  # 檔案過期時間
     analysis_result = Column(Text, nullable=True)  # 分析結果 (文字摘要)
-    
+
     # 關聯到使用者
     user = relationship("User", back_populates="files")
 

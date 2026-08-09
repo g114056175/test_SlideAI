@@ -104,7 +104,8 @@ def synthesize_tts_preview(
         return False, None, f"unsupported TTS provider: {provider}"
 
     ref_path = ""
-    out_path = tempfile.mktemp(suffix=".wav")
+    out_fd, out_path = tempfile.mkstemp(prefix="slideai_tts_adapter_", suffix=".wav")
+    os.close(out_fd)
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=reference_suffix or ".wav") as fp:
             fp.write(reference_audio_bytes)
@@ -172,7 +173,8 @@ def transcribe_reference_audio(
 def align_subtitles(
     *,
     text: str,
-    audio_bytes: bytes,
+    audio_bytes: bytes | None = None,
+    audio_source_path: str | None = None,
     audio_filename: str,
     language: str = "auto",
     alignment_mode: str = "auto",
@@ -186,6 +188,7 @@ def align_subtitles(
         return align_subtitles_from_audio_and_text(
             text=text,
             audio_bytes=audio_bytes,
+            audio_source_path=audio_source_path,
             audio_filename=audio_filename,
             language=language,
             alignment_mode=alignment_mode,
@@ -198,11 +201,18 @@ def align_subtitles(
         raise RuntimeError(f"unsupported alignment provider: {provider}")
 
     audio_path = ""
+    owns_audio_path = False
     try:
-        suffix = Path(audio_filename or "audio.wav").suffix or ".wav"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as fp:
-            fp.write(audio_bytes)
-            audio_path = fp.name
+        if audio_source_path:
+            audio_path = str(Path(audio_source_path).expanduser().resolve())
+            if not Path(audio_path).is_file():
+                raise FileNotFoundError(f"audio file not found: {audio_path}")
+        else:
+            suffix = Path(audio_filename or "audio.wav").suffix or ".wav"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as fp:
+                fp.write(audio_bytes or b"")
+                audio_path = fp.name
+            owns_audio_path = True
         result = _run_command_adapter(
             "SLIDEAI_ALIGNMENT_ADAPTER_COMMAND",
             {
@@ -226,7 +236,8 @@ def align_subtitles(
             warning=str(result.get("warning") or ""),
             readable_chunks=list(result.get("readable_chunks") or []),
             source_text=str(result.get("source_text") or text),
+            match_ratio=float(result.get("match_ratio") or 1.0),
         )
     finally:
-        if audio_path:
+        if audio_path and owns_audio_path:
             Path(audio_path).unlink(missing_ok=True)

@@ -3,22 +3,26 @@ import logging
 import json
 import asyncio
 import tempfile
+import shutil
+import zipfile
 from datetime import datetime
 from typing import Optional, List
 import re
 import uuid
 from urllib.parse import quote
 
-import PyPDF2
+import pypdf as PyPDF2
 from fastapi import APIRouter, UploadFile, File, Form, Request, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
 from pdf2image import convert_from_path
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from PIL import Image
 
 from backend.app.api.video_helpers import is_truthy_env
 from backend.app.services.artifact_store import get_video_run_store
 from backend.app.services.alignment.subtitle_builder import build_srt
+from backend.app.services.video_merge import merge_video_files
 
 logger = logging.getLogger("video_abstract")
 router = APIRouter()
@@ -30,7 +34,7 @@ async def get_llm_status():
     from backend.app.services.utility.api import get_llm_config_summary
     config = get_llm_config_summary()
     return JSONResponse({
-        "configured": bool(config.get("has_key")),
+        "configured": bool(config.get("configured")),
         "provider": str(config.get("provider") or "missing"),
         "model": str(config.get("model") or ""),
     })
@@ -51,59 +55,26 @@ def _content_disposition_attachment(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
 
 
-async def _merge_video_files_to_bytes(input_paths: list[str]) -> bytes:
-    if not input_paths:
-        raise HTTPException(status_code=400, detail="沒有可合併的片段")
-
-    temp_dir = tempfile.mkdtemp(prefix="slideai_run_merge_")
+def _download_bundle(entries: list[tuple[str, str]], filename: str) -> FileResponse:
+    """Create a temporary ZIP without recompressing already-compressed videos."""
+    temp_dir = tempfile.mkdtemp(prefix="slideai_download_")
+    zip_path = os.path.join(temp_dir, "download.zip")
     try:
-        list_file = os.path.join(temp_dir, "concat.txt")
-        with open(list_file, "w", encoding="utf-8") as f:
-            for p in input_paths:
-                safe_p = str(p).replace("'", "'\\''")
-                f.write(f"file '{safe_p}'\n")
-
-        out_path = os.path.join(temp_dir, "merged.mp4")
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", list_file,
-            "-c", "copy",
-            out_path,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            for source_path, archive_name in entries:
+                if source_path and os.path.isfile(source_path):
+                    archive.write(source_path, arcname=archive_name)
+        if not os.path.isfile(zip_path) or os.path.getsize(zip_path) == 0:
+            raise RuntimeError("下載壓縮檔建立失敗")
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename=filename,
+            background=BackgroundTask(shutil.rmtree, temp_dir, ignore_errors=True),
         )
-        _stdout, stderr = await proc.communicate()
-        if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            out_path = os.path.join(temp_dir, "merged_reencode.mp4")
-            ffmpeg_cmd2 = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", list_file,
-                "-c:v", "libx264",
-                "-c:a", "aac",
-                "-pix_fmt", "yuv420p",
-                out_path,
-            ]
-            proc2 = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd2,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _stdout2, stderr2 = await proc2.communicate()
-            if proc2.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-                err_text = ((stderr or b"").decode(errors="ignore") + "\n" + (stderr2 or b"").decode(errors="ignore")).strip()
-                raise HTTPException(status_code=500, detail=f"影片合併失敗: {err_text[-500:]}")
-
-        with open(out_path, "rb") as f:
-            return f.read()
-    finally:
-        import shutil
-
+    except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
 
 
 async def _media_duration_seconds(path: str) -> float:
@@ -123,8 +94,8 @@ class LocalPdfRunRequest(BaseModel):
     pdf_path: str
     subtitle_source: str = "none"
     run_label: str = ""
-    settings: dict = {}
-    scripts: list[str] = []
+    settings: dict = Field(default_factory=dict)
+    scripts: list[str] = Field(default_factory=list)
 
 
 class VideoRunUpdateRequest(BaseModel):
@@ -424,10 +395,10 @@ async def generate_video_run_scripts(run_id: str, req: VideoRunGenerateScriptsRe
     if not pdf_path or not os.path.isfile(pdf_path):
         raise HTTPException(status_code=404, detail="Run PDF not found")
 
-    from backend.app.services.utility.api import get_llm_api_key
+    from backend.app.services.utility.api import get_llm_api_key, llm_is_configured
     api_key = get_llm_api_key()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="LLM api_key is missing in backend/.env")
+    if not llm_is_configured():
+        raise HTTPException(status_code=400, detail="LLM provider, model or endpoint is not configured in backend/.env")
 
     pages = manifest.get("pages") or []
     page_count = len(pages)
@@ -442,21 +413,68 @@ async def generate_video_run_scripts(run_id: str, req: VideoRunGenerateScriptsRe
 
     try:
         from backend.app.services.utility.api import (
+            generate_presentation_scripts,
             generate_presentation_scripts_from_pdf_file,
-            get_google_generative_model_name,
+            get_configured_llm_provider,
+            get_llm_model_name,
         )
-        model_name = get_google_generative_model_name()
+        provider = get_configured_llm_provider(api_key)
+        model_name = get_llm_model_name(provider)
         logger.info(
-            "[VideoRun] scripts.generate run=%s scope=%s pages=%s model=%s key_prefix=%s",
+            "[VideoRun] scripts.generate run=%s scope=%s pages=%s provider=%s model=%s key_prefix=%s",
             run_id,
             scope,
             requested,
+            provider,
             model_name,
             (api_key[:8] + "***") if api_key else "",
         )
 
         gen_requested: list[int] = []
         generated_map: dict[int, str] = {}
+
+        # Gemini accepts the original PDF directly. Other built-in and custom
+        # OpenAI-compatible providers use the PDF text extraction path so a
+        # local endpoint does not need multimodal/PDF support.
+        if provider != "google":
+            from backend.app.services.utility.pdf import pdf_to_text_array
+
+            page_texts = list(await asyncio.to_thread(pdf_to_text_array, pdf_path) or [])
+            selected_texts = [page_texts[idx] if idx < len(page_texts) else "" for idx in requested]
+            generated = await generate_presentation_scripts(
+                text_array=selected_texts,
+                api_key=api_key,
+                language=req.language,
+            )
+            for result_idx, page_idx in enumerate(requested):
+                body = generated[result_idx] if result_idx < len(generated or []) else ""
+                normalized = _trim_redundant_opening(page_idx, _normalize_script_text(body))
+                if normalized:
+                    generated_map[page_idx] = normalized
+            gen_requested = [idx for idx in requested if generated_map.get(idx)]
+
+            scripts = [str(p.get("script") or "") for p in pages]
+            while len(scripts) < page_count:
+                scripts.append("")
+            if scope == "all":
+                for page_idx in requested:
+                    scripts[page_idx] = ""
+            for page_idx in gen_requested:
+                scripts[page_idx] = generated_map[page_idx]
+            updated_manifest = get_video_run_store().update_page_scripts(run_id, scripts)
+            return JSONResponse({
+                "run": updated_manifest,
+                "scripts": scripts,
+                "updated_pages": gen_requested,
+                "skipped_empty_pages": [idx for idx in requested if idx not in set(gen_requested)],
+                "text_stats": {
+                    "requested_pages": len(requested),
+                    "non_empty_pages": len(gen_requested),
+                },
+                "source": "pdf-text-extraction",
+                "provider": provider,
+                "scope": scope,
+            })
 
         if scope == "all":
             lang = str(req.language or "zh").lower()
@@ -650,6 +668,23 @@ async def get_video_run_variant_video(run_id: str, page_index: int, variant_id: 
         raise HTTPException(status_code=404, detail="Page not found")
 
 
+@router.get("/api/video-runs/{run_id}/pages/{page_index}/variants/{variant_id}/audio")
+async def get_video_run_variant_audio(run_id: str, page_index: int, variant_id: str):
+    """Stream one persisted TTS result without routing it through browser uploads."""
+    try:
+        path = get_video_run_store().get_variant_audio_path(
+            run_id=run_id, page_index=page_index, variant_id=variant_id,
+        )
+        return FileResponse(
+            str(path), media_type="audio/wav",
+            filename=f"{run_id}_page_{page_index + 1}_{variant_id}.wav",
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Variant audio not found")
+    except IndexError:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+
 @router.get("/api/video-runs/{run_id}/pages/{page_index}/variants/{variant_id}/subtitles.srt")
 async def get_video_run_variant_srt(run_id: str, page_index: int, variant_id: str):
     """Download the persisted sidecar subtitle timeline for a page variant."""
@@ -663,6 +698,29 @@ async def get_video_run_variant_srt(run_id: str, page_index: int, variant_id: st
         )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Variant SRT not found")
+    except IndexError:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+
+@router.get("/api/video-runs/{run_id}/pages/{page_index}/variants/{variant_id}/download.zip")
+async def get_video_run_variant_bundle(run_id: str, page_index: int, variant_id: str):
+    """Download a page video and its optional SRT as one ZIP archive."""
+    store = get_video_run_store()
+    try:
+        video_path = str(store.get_variant_video_path(
+            run_id=run_id, page_index=page_index, variant_id=variant_id,
+        ))
+        entries = [(video_path, f"page_{page_index + 1}.mp4")]
+        try:
+            srt_path = str(store.get_variant_srt_path(
+                run_id=run_id, page_index=page_index, variant_id=variant_id,
+            ))
+            entries.append((srt_path, f"page_{page_index + 1}.srt"))
+        except FileNotFoundError:
+            pass
+        return _download_bundle(entries, f"{run_id}_page_{page_index + 1}_{variant_id}.zip")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Variant video not found")
     except IndexError:
         raise HTTPException(status_code=404, detail="Page not found")
 
@@ -705,6 +763,7 @@ async def merge_selected_video_run_variants(
     page_indexes_json: str = Form("[]"),
     variant_ids_json: str = Form("{}"),
     response_mode: str = Form("json"),
+    transitions_enabled: bool = Form(False),
 ):
     """Merge persisted page-variant MP4s and save the merged export variant.
 
@@ -780,15 +839,14 @@ async def merge_selected_video_run_variants(
         if (
             old.get("source_pages") == source_pages
             and old_settings.get("source_variants") == source_variants
+            and bool((old_settings.get("transitions") or {}).get("enabled")) == bool(transitions_enabled)
             and old_video
             and os.path.isfile(old_video)
         ):
             store.select_export_variant(run_id=run_id, variant_id=old.get("variant_id"))
             if wants_video_response:
-                with open(old_video, "rb") as f:
-                    video_bytes = f.read()
-                return Response(
-                    content=video_bytes,
+                return FileResponse(
+                    old_video,
                     media_type="video/mp4",
                     headers={
                         "Content-Disposition": _content_disposition_attachment(download_filename),
@@ -806,7 +864,17 @@ async def merge_selected_video_run_variants(
                 headers={"X-Export-Variant-Id": old.get("variant_id", "")},
             )
 
-    merged_bytes = await _merge_video_files_to_bytes(input_paths)
+    merge_temp_dir = tempfile.mkdtemp(prefix="slideai_run_merge_")
+    try:
+        merged_path, transition_metadata = await merge_video_files(
+            input_paths,
+            merge_temp_dir,
+            transitions_enabled=transitions_enabled,
+        )
+    except (RuntimeError, ValueError) as exc:
+        import shutil
+        shutil.rmtree(merge_temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(exc))
     merged_segments: list[dict] = []
     offset = 0.0
     for video_path, segment_path in zip(input_paths, source_segment_paths):
@@ -826,22 +894,27 @@ async def merge_selected_video_run_variants(
                 logger.warning("Cannot include page SRT in merged export: %s", exc)
         offset += await _media_duration_seconds(video_path)
     merged_srt = build_srt(merged_segments) if merged_segments else ""
-    variant = store.record_export_variant(
-        run_id=run_id,
-        video_bytes=merged_bytes,
-        source_pages=source_pages,
-        settings={
-            "source_variants": source_variants,
-            "requested_page_indexes": page_indexes,
-            "missing": missing,
-        },
-        label=f"merged-{len(source_pages)}-pages",
-        srt_content=merged_srt,
-    )
+    try:
+        variant = store.record_export_variant(
+            run_id=run_id,
+            video_source_path=merged_path,
+            source_pages=source_pages,
+            settings={
+                "source_variants": source_variants,
+                "requested_page_indexes": page_indexes,
+                "missing": missing,
+                "transitions": transition_metadata,
+            },
+            label=f"merged-{len(source_pages)}-pages" + ("-transitions" if transitions_enabled else ""),
+            srt_content=merged_srt,
+        )
+    finally:
+        import shutil
+        shutil.rmtree(merge_temp_dir, ignore_errors=True)
 
     if wants_video_response:
-        return Response(
-            content=merged_bytes,
+        return FileResponse(
+            str((variant.get("paths") or {}).get("video") or ""),
             media_type="video/mp4",
             headers={
                 "Content-Disposition": _content_disposition_attachment(download_filename),
@@ -884,6 +957,29 @@ async def get_video_run_export_srt(run_id: str, variant_id: str):
         return FileResponse(str(path), media_type="application/x-subrip; charset=utf-8", filename=f"{run_id}_{variant_id}.srt")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Export SRT not found")
+
+
+@router.get("/api/video-runs/{run_id}/exports/{variant_id}/download.zip")
+async def get_video_run_export_bundle(run_id: str, variant_id: str):
+    """Download a merged video and its optional SRT as one ZIP archive."""
+    store = get_video_run_store()
+    try:
+        manifest = store.load_manifest(run_id)
+        video_path = str(store.get_export_video_path(run_id=run_id, variant_id=variant_id))
+        base_name = _safe_download_filename(
+            manifest.get("display_name") or manifest.get("original_filename") or run_id,
+            fallback=run_id,
+        )
+        base_name = re.sub(r"\.mp4$", "", base_name, flags=re.IGNORECASE)
+        entries = [(video_path, f"{base_name}.mp4")]
+        try:
+            srt_path = str(store.get_export_srt_path(run_id=run_id, variant_id=variant_id))
+            entries.append((srt_path, f"{base_name}.srt"))
+        except FileNotFoundError:
+            pass
+        return _download_bundle(entries, f"{base_name}.zip")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Export video not found")
 
 
 @router.post("/api/video-runs/{run_id}/exports/{variant_id}/select")

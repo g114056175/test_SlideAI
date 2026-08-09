@@ -4,7 +4,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError, ExpiredSignatureError
+import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError as JWTError
 from datetime import datetime, timedelta, date
 from backend.app.models import User, UsageRecord, UserFile, Project, Base
 from typing import Generator

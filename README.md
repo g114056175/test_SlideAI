@@ -32,6 +32,11 @@ Qwen3-ASR／Qwen3 ForcedAligner 產生逐字時間軸
 TTS、ASR、強制對齊採階段式載入；切換到下一階段會釋放上一個 GPU worker，
 並另有 60–120 秒閒置卸載機制作為保險，避免模型同時堆疊顯存。
 
+「渲染全部」採單一後端程序的持久化 FIFO GPU queue。多人同時送出時只有
+一個批次會進行 TTS → 對齊 → 渲染，其餘任務可看到前方任務數、目前工作站
+階段及自己的逐頁進度；後端重啟後會依建立時間恢復尚未完成的任務。外部
+LLM 呼叫則由 `LLM_MAX_CONCURRENCY` 設定全站共用併發上限，預設為 3。
+
 ## 系統需求
 
 - Ubuntu 24.04（目前主要測試平台）
@@ -43,6 +48,26 @@ TTS、ASR、強制對齊採階段式載入；切換到下一階段會釋放上�
 
 目前 Docker 映像鎖定 Linux x86-64、Python 3.12、CUDA 13 系列 PyTorch。
 Windows 並非目前正式支援的直接部署平台。
+
+`New_slideai.sh` 是目前測試中的引導式建制入口。它會先檢查 Linux/x86-64、
+Docker、NVIDIA GPU/runtime，再分別詢問是否建置前後端、下載或指定 TTS、ASR、
+強制對齊模型，以及設定 LLM。Ubuntu/Debian 可由腳本協助安裝 Docker；其他
+Linux 發行版只要事先備妥 Docker Engine、Compose v2、NVIDIA driver 與
+Container Toolkit，仍可使用相同 Docker 映像。ARM、AMD GPU 與純 CPU
+推論目前不屬於完整語音工作流的支援範圍。
+
+若 Ubuntu/Debian 已有可用 NVIDIA driver、但 Docker 尚未註冊 GPU runtime，
+建制精靈會在確認後依 [NVIDIA 官方指南](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+安裝 Container Toolkit 並設定 Docker；它不會自行更新或更換主機 kernel／driver。
+
+```bash
+chmod +x New_slideai.sh
+./New_slideai.sh
+```
+
+LLM 可選 Gemini、OpenAI、Claude、OpenRouter、xAI、Groq，或自訂
+OpenAI-compatible `chat/completions` URL。本地 llama.cpp 等無驗證 endpoint
+可以留空 API key；實際憑證寫入權限為 `0600` 的 `backend/.env`。
 
 ## 一鍵啟動
 

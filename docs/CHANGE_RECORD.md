@@ -96,4 +96,136 @@ When asking an agent to implement or merge changes, include:
 
 #### Rollback
 - Revert the two files above to `8000` defaults, or set `VITE_API_URL` per developer environment.
-s834
+
+### [CR-20260731-001] Batch Rendering Uses Stage-Based GPU Scheduling
+- Date: 2026-07-31
+- Author: Codex Agent
+- Type: refactor
+- Scope: frontend
+- Related Issue/PR: N/A
+
+#### Why
+- The render-all workflow previously alternated TTS, forced alignment, and video rendering for every page.
+- TTS and alignment intentionally release each other's GPU worker, so page-wise alternation caused both models to reload repeatedly in a multi-page project.
+
+#### What Changed
+- Files:
+  - `frontend/src/composables/useRenderQueue.js`
+- Behavior:
+  - Before: each page ran `TTS -> alignment -> video`, then the next page repeated the same sequence.
+  - After: the batch runs `all TTS -> all alignment -> all video rendering`.
+  - Single-page rendering is unchanged.
+  - `none`, `sidecar`, and `burn` subtitle modes retain their original output behavior.
+  - Prepared browser-side audio/alignment objects are released after each page render and cleared on completion or failure.
+
+#### API/Contract Impact
+- Endpoint/Interface: none
+- Backward Compatibility: compatible
+
+#### Risks
+- A large batch temporarily retains the generated audio blobs until the alignment/render stages finish.
+- A later backend-orchestrated job API should replace these browser-side intermediate blobs for very large projects.
+
+#### Verification
+- `npm run build`: passed with Vite 5.4.21.
+- `scripts/smoke_test.sh`: passed frontend, backend, history API, LLM status, and CORS checks.
+- Mocked three-page workflow:
+  - `none`: all TTS requests completed before all video requests.
+  - `sidecar`: all TTS requests completed before all alignment requests, followed by all video requests.
+  - `burn`: all TTS requests completed before all alignment requests, followed by all video requests.
+
+#### Rollback
+- Restore `frontend/src/composables/useRenderQueue.js` from `/home/g114056175/my_vscode/SlideAI.20260731.bak`.
+
+### [CR-20260731-002] Use Video-Run PDF as the Canonical Upload
+- Date: 2026-07-31
+- Author: Codex Agent
+- Type: refactor
+- Scope: backend
+- Related Issue/PR: N/A
+
+#### Why
+- Every upload kept one UUID PDF under `backend/app/tmp_pdf` and another copy under the persistent video run.
+- Re-uploading the same source accumulated duplicate PDFs without a retention policy.
+
+#### What Changed
+- Files:
+  - `backend/app/api/video.py`
+  - `backend/app/services/artifact_store.py`
+- Behavior:
+  - New uploads are written directly to `data/video_runs/<run_id>/input/`.
+  - The run manifest PDF is the single canonical project PDF.
+  - The legacy `pdf_id` thumbnail endpoint now resolves the matching run manifest and uses its cached page image or canonical PDF.
+  - New uploads no longer write to `backend/app/tmp_pdf`.
+  - The existing 11 temporary PDF copies and the obsolete `tmp_pdf` directory were deleted.
+  - Obsolete cleanup/exclusion references were removed from the smoke test and handoff-bundle scripts.
+
+#### API/Contract Impact
+- Endpoint/Interface: `/api/video-abstract/thumbnail` keeps the same query contract.
+- Backward Compatibility: compatible for projects that have a persistent video-run manifest.
+
+#### Risks
+- A legacy database-only project with no matching `data/video_runs` manifest and no persistent thumbnail can no longer use the removed temporary PDF fallback.
+- Current Lab projects all use video-run manifests and the run-specific thumbnail API.
+
+#### Verification
+- Python compilation passed for `video.py` and `artifact_store.py`.
+- Existing `pdf_id` values resolved to their persistent manifests.
+- Three existing projects returned valid 1280px JPEG thumbnails through the legacy endpoint.
+- A real three-page PDF upload created only the canonical run PDF, returned a valid thumbnail, and did not recreate `tmp_pdf`.
+- The temporary test run was removed.
+- `scripts/smoke_test.sh` passed after backend restart.
+
+#### Rollback
+- Restore the two backend files and any required legacy PDFs from `/home/g114056175/my_vscode/SlideAI.20260731.bak`.
+
+### [CR-20260731-003] Safer Bilingual Subtitle Splitting and Numeric Alignment Repair
+- Date: 2026-07-31
+- Author: Codex Agent
+- Type: fix
+- Scope: backend, tests
+- Related Issue/PR: N/A
+
+#### Why
+- English titles and reference abbreviations could create accidental one-word subtitles such as `Dr`.
+- Times such as `10:30` could be split at the colon, and mixed tokens such as `Qwen3 ForcedAligner` could lose their space.
+- Short-line rebalancing could duplicate already-moved tokens.
+- Numeric/unit repair did not detect split aligner units (`1.23` + `GB`), could mistake a natural pause for an anomaly, used Chinese spoken forms for English, and accepted a second pass without a quality gate.
+
+#### What Changed
+- Files:
+  - `backend/app/services/alignment/sentence_splitter.py`
+  - `backend/app/services/alignment/repair.py`
+  - `backend/app/services/subtitle_alignment.py`
+  - `backend/tests/test_sentence_splitter.py`
+  - `backend/tests/test_alignment_repair.py`
+- Behavior:
+  - Protects English titles, initials, reference abbreviations, clocks, compact colons, URLs, ports, versions, decimals, numeric units, code spans, and closing quotes.
+  - Restores English spacing without separating compact numeric units.
+  - Prevents duplicate token movement during orphan-line repair.
+  - Prefers complete English prepositional/subordinate phrases and merges soft-fit short lines.
+  - Detects combined and split numeric/unit alignment anomalies using duration, following gaps, and local timing rates.
+  - Rewrites numeric/unit text with language-aware Chinese or English spoken forms.
+  - Corrects Chinese large-number zero handling.
+  - Rejects a second alignment pass when text similarity, span count, monotonicity, duration, or audio bounds are invalid.
+
+#### API/Contract Impact
+- Endpoint/Interface: none
+- Backward Compatibility: compatible; existing request/response fields and subtitle modes are unchanged.
+
+#### Risks
+- Abbreviation and line-break preferences remain rule based; uncommon domain abbreviations may need to be added to the regression corpus.
+- Numeric spoken forms depend on how the selected TTS reads a unit. Failed or low-quality second passes retain the original timeline.
+
+#### Verification
+- Python compilation passed for the splitter, repair module, alignment service, and tests.
+- 14 deterministic regression tests passed.
+- 384 generated mixed Chinese/English combinations preserved all spoken text, with no accidental abbreviation/time fragments.
+- Existing project corpus: 3 script files, 31 pages, 550 subtitle segments; zero text-preservation failures, zero segments under 4 display units, and zero segments over the 36.5 soft maximum.
+- Splitter benchmark on the existing 31 pages: about 8.9 ms total / 0.29 ms per page after warm-up.
+- Live VoxCPM2 + Qwen3 ForcedAligner test passed for Chinese and English technical scripts.
+- The Chinese live test detected a collapsed `1.23GB` word timeline and expanded it from roughly 1 ms to roughly 720 ms while preserving the same page-level segment boundaries.
+- `scripts/smoke_test.sh` passed after the native service restart.
+
+#### Rollback
+- Restore the three backend service files from `/home/g114056175/my_vscode/SlideAI.20260731.bak` and remove the two added regression-test files.

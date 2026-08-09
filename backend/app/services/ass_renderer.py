@@ -109,7 +109,7 @@ def tokenize_pieces(text: str):
     if re.search(r'\s', text):
         parts = [p for p in re.split(r'(\s+)', text) if p]
         return [{"text": p, "hg": not is_punc_or_space(p)} for p in parts]
-    
+
     out = []
     ascii_buf = ""
     def flush():
@@ -144,18 +144,18 @@ def smooth_word_timeline(words, seg_start, seg_end, min_word_sec=0.09):
     seg_start = float(seg_start)
     seg_end = float(seg_end)
     seg_dur = max(0.001, seg_end - seg_start)
-    
+
     requested_min = max(0.03, min_word_sec)
     feasible_min = max(0.02, (seg_dur / max(n, 1)) * 0.9)
     min_dur = min(requested_min, feasible_min)
-    
+
     uniform_dur = seg_dur / n
     blend_raw = 0.25
-    
+
     boundaries = [0] * (n + 1)
     boundaries[0] = seg_start
     boundaries[n] = seg_end
-    
+
     for i in range(1, n):
         prev = words[i - 1]
         cur = words[i]
@@ -167,16 +167,16 @@ def smooth_word_timeline(words, seg_start, seg_end, min_word_sec=0.09):
             raw_mid = seg_start + i * uniform_dur
         uni_mid = seg_start + i * uniform_dur
         boundaries[i] = (blend_raw * raw_mid) + ((1 - blend_raw) * uni_mid)
-        
+
     for i in range(1, n + 1):
         boundaries[i] = max(boundaries[i], boundaries[i - 1] + min_dur)
     boundaries[n] = seg_end
     for i in range(n - 1, -1, -1):
         boundaries[i] = min(boundaries[i], boundaries[i + 1] - min_dur)
-        
+
     boundaries[0] = seg_start
     boundaries[n] = seg_end
-    
+
     out = []
     for i in range(n):
         s = max(seg_start, boundaries[i])
@@ -295,21 +295,21 @@ def generate_ass_script(
     outline_width: int = 2,
 ) -> str:
     alpha_hex = f"{int(255 - (alpha / 100) * 255):02X}"
-    
+
     base_color = f"&H00{_hex_to_ass_bgr(text_color)}"
     hg_color = f"&H00{_hex_to_ass_bgr(highlight_color)}"
-    
+
     border_style = 4
     outline = max(0, int(outline_width)) if enable_outline else 0
     shadow = max(1, round(font_size * 0.25))
-    
+
     bgr = _hex_to_ass_bgr(background_color)
     outline_color_ass = f"&H00{_hex_to_ass_bgr(outline_color)}"
     if style == 'bg-gray':
         bg_color = f"&H{alpha_hex}{bgr}"
         final_outline_color = outline_color_ass
     elif style == 'stroke-dark':
-        border_style = 1 
+        border_style = 1
         outline = max(outline, max(2, int(font_size * 0.08)))
         shadow = 0
         bg_color = "&HFF000000"
@@ -317,11 +317,11 @@ def generate_ass_script(
     else:
         bg_color = f"&H{alpha_hex}{bgr}"
         final_outline_color = outline_color_ass
-        
+
     marginV = int(height * 0.04) if margin_v is None else max(12, int(margin_v))
     if (not enable_background) or int(alpha) <= 0:
         shadow = 0
-    
+
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -337,7 +337,7 @@ Style: Layer1,Noto Sans CJK TC,{font_size},{base_color},{base_color},{final_outl
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
-    
+
     for seg_idx, seg in enumerate(segments):
         seg_start = float(seg.get("start", 0))
         seg_end = float(seg.get("end", 0))
@@ -349,9 +349,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 next_seg_start = float(segments[seg_idx + 1].get("start", 0))
             except Exception:
                 next_seg_start = None
-        
+
         has_cjk = any("\u4e00" <= c <= "\u9fff" for c in seg_text)
-        
+
         event_end = _segment_event_end(seg_end, next_seg_start, words)
         event_end_ms = int(max(0, (event_end - seg_start) * 1000))
 
@@ -359,7 +359,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             events.append(f"Dialogue: 0,{format_ass_time(seg_start)},{format_ass_time(event_end)},Layer0,,0,0,0,,{seg_text}")
             events.append(f"Dialogue: 1,{format_ass_time(seg_start)},{format_ass_time(event_end)},Layer1,,0,0,0,,{seg_text}")
             continue
-            
+
         # 非 Qwen：使用既有平滑
         # Qwen：使用「不改整段起訖」的穩定補齊，避免跳字但不造成整體延後
         token_timeline = build_qwen_stable_timeline(words, seg_start, seg_end) if is_qwen else smooth_word_timeline(words, seg_start, seg_end)
@@ -367,10 +367,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             events.append(f"Dialogue: 0,{format_ass_time(seg_start)},{format_ass_time(event_end)},Layer0,,0,0,0,,{seg_text}")
             events.append(f"Dialogue: 1,{format_ass_time(seg_start)},{format_ass_time(event_end)},Layer1,,0,0,0,,{seg_text}")
             continue
-            
+
         plain_events = []
         tagged_events = []
-        
+
         for i, token in enumerate(token_timeline):
             t_str = str(token.get('text', ''))
             t1 = int((float(token["start"]) - seg_start) * 1000)
@@ -388,7 +388,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 t2h = max(t2, next_t1 - 1)
             else:
                 t2h = max(t2, event_end_ms - 1)
-            
+
             pieces = tokenize_pieces(t_str)
             for p in pieces:
                 plain_events.append(p["text"])
@@ -396,24 +396,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     tagged_events.append(f"{{\\c{base_color}&\\t({t1},{t1+1},\\c{hg_color}&)\\t({t2h},{t2h+1},\\c{base_color}&)}}{p['text']}")
                 else:
                     tagged_events.append(f"{{\\c{base_color}&}}{p['text']}")
-            
+
             if i < len(token_timeline) - 1:
                 t1_char = t_str[-1] if t_str else ""
                 t2_char = str(token_timeline[i+1].get("text", ""))[0] if str(token_timeline[i+1].get("text", "")) else ""
-                
+
                 is_ascii1 = t1_char.isalnum()
                 is_ascii2 = t2_char.isalnum()
                 def check_cjk(s): return any('\u4e00' <= c <= '\u9fff' for c in s)
                 is_cjk1 = check_cjk(t1_char)
                 is_cjk2 = check_cjk(t2_char)
-                
+
                 if (is_ascii1 and is_ascii2) or (is_cjk1 and is_ascii2) or (is_ascii1 and is_cjk2):
                     plain_events.append(" ")
                     tagged_events.append(f"{{\\c{base_color}&}} ")
-                    
+
         layer0_str = "".join(plain_events)
         layer1_str = "".join(tagged_events)
-        
+
         events.append(f"Dialogue: 0,{format_ass_time(seg_start)},{format_ass_time(event_end)},Layer0,,0,0,0,,{layer0_str}")
         events.append(f"Dialogue: 1,{format_ass_time(seg_start)},{format_ass_time(event_end)},Layer1,,0,0,0,,{{\\c{base_color}&}}{layer1_str}{{\\c{base_color}&}}")
 

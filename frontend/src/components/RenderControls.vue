@@ -18,12 +18,28 @@
       >
         終止: 第{{ pageIdx + 1 }}頁
       </button>
-      <button class="btn btn-outline-light merge-btn" :disabled="!renderedCount" @click="$emit('merge')">
-        合併匯出
-      </button>
-      <button v-if="hasSelectedSrt" class="btn btn-outline-info" @click="$emit('download-srt')">
-        下載本頁 SRT
-      </button>
+      <div class="merge-action">
+        <button
+          class="btn merge-btn"
+          :disabled="!renderedCount"
+          :aria-expanded="showMergeOptions"
+          @click="showMergeOptions = !showMergeOptions"
+        >合併匯出 <span class="merge-caret">▾</span></button>
+        <div v-if="showMergeOptions" class="merge-options" role="menu">
+          <button type="button" role="menuitem" @click="chooseMerge(false)">
+            直接合併
+          </button>
+          <button type="button" role="menuitem" @click="chooseMerge(true)">
+            自動轉場
+          </button>
+        </div>
+      </div>
+      <DownloadMenu
+        label="下載本頁"
+        :video-url="downloadVideoUrl"
+        :srt-url="downloadSrtUrl"
+        :bundle-url="downloadBundleUrl"
+      />
     </div>
     <div class="alert py-2 mb-0 render-status-bar" :class="message ? 'alert-info' : 'alert-secondary'">
       {{ message || '待命：尚未開始渲染。' }}
@@ -32,7 +48,8 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import DownloadMenu from './DownloadMenu.vue'
 
 const props = defineProps({
   hasSelectedSlide: { type: Boolean, default: false },
@@ -44,12 +61,20 @@ const props = defineProps({
   queueLength: { type: Number, default: 0 },
   cancellableSinglePages: { type: Array, default: () => [] },
   message: { type: String, default: '' },
-  hasSelectedSrt: { type: Boolean, default: false },
+  downloadVideoUrl: { type: String, default: '' },
+  downloadSrtUrl: { type: String, default: '' },
+  downloadBundleUrl: { type: String, default: '' },
 })
 
-defineEmits(['render-current', 'render-all', 'stop-all', 'stop-page', 'merge', 'download-srt'])
+const emit = defineEmits(['render-current', 'render-all', 'stop-all', 'stop-page', 'merge'])
 
 const showStopAll = computed(() => props.rendering || props.renderingAll || props.queueLength > 0)
+const showMergeOptions = ref(false)
+
+const chooseMerge = (transitionsEnabled) => {
+  showMergeOptions.value = false
+  emit('merge', !!transitionsEnabled)
+}
 </script>
 
 <style scoped>
@@ -82,8 +107,80 @@ const showStopAll = computed(() => props.rendering || props.renderingAll || prop
   color: #ffffff;
 }
 
-.merge-btn {
+.merge-action {
+  position: relative;
   margin-left: auto;
+  z-index: 15;
+}
+
+.merge-btn {
+  min-width: 112px;
+  color: #eff6ff;
+  border: 1px solid #3b82f6;
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  box-shadow: 0 5px 14px rgba(37, 99, 235, 0.2);
+}
+
+.merge-btn:hover:not(:disabled) {
+  color: #ffffff;
+  border-color: #60a5fa;
+  background: linear-gradient(135deg, #3b82f6, #2563eb);
+}
+
+.merge-caret {
+  margin-left: 5px;
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.merge-options {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  width: 152px;
+  padding: 6px;
+  border: 1px solid #334155;
+  border-radius: 10px;
+  background: #0b1220;
+  box-shadow: 0 18px 40px rgba(2, 6, 23, 0.48);
+}
+
+.merge-options::after {
+  content: '';
+  position: absolute;
+  right: 26px;
+  top: 100%;
+  border: 7px solid transparent;
+  border-top-color: #334155;
+}
+
+.merge-options button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: 7px;
+  color: #e2e8f0;
+  background: transparent;
+  text-align: left;
+}
+
+.merge-options button:hover {
+  background: #172033;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.preview-actions-row > .btn-success {
+  color: #dbeafe;
+  border-color: #475569;
+  background: #1e293b;
+}
+
+.preview-actions-row > .btn-success:hover:not(:disabled) {
+  border-color: #64748b;
+  background: #334155;
 }
 
 .render-status-bar {
@@ -104,7 +201,7 @@ const showStopAll = computed(() => props.rendering || props.renderingAll || prop
     flex: 0 1 auto;
   }
 
-  .merge-btn {
+  .merge-action {
     margin-left: 0;
   }
 }

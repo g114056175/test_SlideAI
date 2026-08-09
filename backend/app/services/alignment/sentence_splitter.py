@@ -35,6 +35,11 @@ _EN_ORPHAN_END = {
     "and", "or", "that", "with", "for", "to", "of", "in", "on", "at",
     "by", "from", "if", "when", "while", "because", "so", "than", "as",
 }
+_EN_PREFERRED_BREAK_BEFORE = {
+    "in", "on", "at", "by", "from", "with", "without",
+    "after", "before", "when", "while", "because",
+    "although", "whereas", "but", "which",
+}
 _EN_DISCOURSE_MARKERS = {
     "however", "therefore", "furthermore", "moreover", "meanwhile",
     "consequently", "thus", "instead", "otherwise", "specifically",
@@ -82,6 +87,17 @@ _STRONG_PUNCT = set("。！？!?；;\n")
 # such as "模型、方法、" should stay eligible to merge with following text.
 _WEAK_PUNCT = set("，,:：…")
 _WEAK_TAIL_ROLLBACK = {"將", "與", "在", "以", "並", "而", "及"}
+_NON_TERMINAL_DOT_ABBREVIATIONS = {
+    "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st",
+    "fig", "eq", "no", "dept", "inc", "vs",
+}
+_CONTINUATION_DOTTED_ABBREVIATIONS = {"e.g", "i.e"}
+_TIME_DOTTED_ABBREVIATIONS = {"a.m", "p.m"}
+_NO_SPACE_ASCII_UNITS = {
+    "b", "kb", "mb", "gb", "tb", "pb",
+    "hz", "khz", "mhz", "ghz",
+    "ms", "px", "fps", "dpi",
+}
 
 
 def _has_cjk(text: Any) -> bool:
@@ -701,10 +717,27 @@ def _join_tokens(tokens: List[str]) -> str:
                 elif p_ascii and t_cjk:
                     out.append(" ")
                 elif p_ascii and t_ascii:
-                    # Keep spaces for English-word boundaries only.
-                    # Do not insert spaces across English<->number boundaries.
-                    if p_last.isalpha() and t_first.isalpha():
+                    # Versions and identifiers are already atomic tokens.
+                    # Reinsert ordinary English spacing, including Qwen3 +
+                    # ForcedAligner and v2.1.0 + and.  Numeric-unit forms such
+                    # as 1.23GB remain compact.
+                    next_core = _strip_edge_punct(tok).lower()
+                    compact_numeric_unit = p_last.isdigit() and next_core in _NO_SPACE_ASCII_UNITS
+                    if not compact_numeric_unit:
                         out.append(" ")
+                elif (
+                    t_ascii
+                    and p_last in ".,;:!?"
+                    and not (
+                        p_last in ",:"
+                        and len(prev) >= 2
+                        and prev[-2].isdigit()
+                        and t_first.isdigit()
+                    )
+                ):
+                    # Preserve normal spacing after English punctuation while
+                    # keeping 1,000 and 10:30 compact.
+                    out.append(" ")
         out.append(tok)
     return "".join(out).strip()
 
@@ -802,6 +835,7 @@ def _repair_short_orphan_lines(lines: List[str], min_chars: int, max_chars: int)
     out: List[str] = []
     i = 0
     min_units = max(8.0, float(min_chars) * 0.6)
+    short_line_limit = max(min_units, float(min_chars) + 1.5)
     while i < len(lines):
         cur = str(lines[i] or "").strip()
         if not cur:
@@ -823,7 +857,7 @@ def _repair_short_orphan_lines(lines: List[str], min_chars: int, max_chars: int)
                 cu = _subtitle_split_units(cur)
                 merged = _smart_concat(cur, nxt)
                 mu = _subtitle_split_units(merged)
-                if cu < min_units and mu <= (max_chars + 2):
+                if cu < short_line_limit and mu <= (max_chars + 4.5):
                     out.append(merged)
                     i += 2
                     continue
@@ -868,10 +902,13 @@ def _rebalance_short_neighbor_lines(lines: List[str], min_chars: int, max_chars:
         nxt = out[i + 1]
         if _subtitle_split_units(cur) < min_chars and _subtitle_split_units(nxt) > min_units:
             nxt_tokens = _tokenize_word_level(nxt)
+            base_cur = cur
             moved: List[str] = []
             while nxt_tokens and _subtitle_split_units(cur) < min_chars:
                 trial_moved = moved + [nxt_tokens[0]]
-                trial_cur = _smart_concat(cur, _join_tokens(trial_moved))
+                # Rebuild from the original line.  Building on the already
+                # updated `cur` duplicates tokens moved in earlier iterations.
+                trial_cur = _smart_concat(base_cur, _join_tokens(trial_moved))
                 if _subtitle_split_units(trial_cur) > max_chars:
                     break
                 moved = trial_moved
@@ -1158,12 +1195,29 @@ def _is_strong_dot_boundary(text: str, idx: int) -> bool:
         j += 1
     next_sig = text[j] if j < len(text) else ""
 
-    # Initial abbreviation patterns like C.C. / U.S. / e.g.
+    # A title/reference abbreviation is followed by its argument, not a new
+    # sentence: Dr. Chen / Fig. 3 / Prof. Wang.
     tail = text[max(0, idx - 12): idx + 1]
-    if re.search(r"(?:\b[A-Za-z]\.){2,}$", tail):
+    word_match = re.search(r"\b([A-Za-z]+)\.$", tail)
+    if word_match and word_match.group(1).lower() in _NON_TERMINAL_DOT_ABBREVIATIONS:
         return False
-    if re.search(r"\b(?:e\.g|i\.e|etc)\.$", tail, re.IGNORECASE):
+    # Person-name initials: J. Smith / J. R. R. Tolkien.
+    if re.search(r"\b[A-Z]\.$", tail) and next_sig.isupper():
         return False
+    dotted_match = re.search(r"\b((?:[A-Za-z]\.){2,})$", tail)
+    dotted_core = dotted_match.group(1).rstrip(".").lower() if dotted_match else ""
+    if dotted_core in _CONTINUATION_DOTTED_ABBREVIATIONS:
+        return False
+    # A time qualifier normally closes the sentence when the following token
+    # starts like a new one: "at 3:45 p.m. They reviewed ...".
+    if dotted_core in _TIME_DOTTED_ABBREVIATIONS:
+        return bool(next_sig and (next_sig.isupper() or _is_cjk_char(next_sig)))
+    # Other dotted acronyms are conservative unless another explicit sentence
+    # boundary follows.  This avoids splitting "U.S. Army".
+    if dotted_match:
+        return False
+    if re.search(r"\betc\.$", tail, re.IGNORECASE):
+        return bool(next_sig and (next_sig.isupper() or _is_cjk_char(next_sig)))
 
     # If no next significant char, treat as sentence end.
     if not next_sig:
@@ -1268,7 +1322,12 @@ def _pack_word_tokens(tokens: List[str], min_chars: int, max_chars: int, unit_fn
             next_core = _strip_edge_punct(next_tok)
             if prev_core.lower() in _EN_ORPHAN_END or prev_core in _ZH_ORPHAN_END or prev_core in _ZH_FORBIDDEN_LINE_END:
                 score -= 2200.0
-            if next_core.lower() in _EN_ORPHAN_END or next_core in _ZH_ORPHAN_END:
+            next_lower = next_core.lower()
+            if next_lower in _EN_PREFERRED_BREAK_BEFORE:
+                # Prefer putting a complete prepositional/subordinate phrase on
+                # the next subtitle: "processes 1.23GB of data" / "in 120ms".
+                score += 420.0
+            elif next_lower in _EN_ORPHAN_END or next_core in _ZH_ORPHAN_END:
                 score -= 500.0
             last_w = _last_ascii_word(prev_tok)
             first_w = _first_ascii_word(next_tok)
@@ -1370,6 +1429,8 @@ def _boundary_penalty(prev_tok: str, next_tok: str) -> float:
     # Avoid line-end orphan connectors (English/Chinese).
     if prev_core.lower() in _EN_ORPHAN_END:
         p += 80.0
+    if next_core.lower() in _EN_PREFERRED_BREAK_BEFORE:
+        p -= 18.0
     if prev_core in _ZH_ORPHAN_END:
         p += 80.0
     if prev_core in _ZH_FORBIDDEN_LINE_END:
@@ -1592,6 +1653,17 @@ def _split_for_readability(raw_text: str, min_chars: int = 6, max_chars: int = 3
             is_strong = ch in _STRONG_PUNCT
             if ch == ".":
                 is_strong = _is_strong_dot_boundary(text, i)
+            # Treat the outer closing quote as the sentence boundary so the
+            # next subtitle never starts with a dangling 」/” after 「...。」.
+            if (
+                ch in _CLOSE_QUOTES
+                and i > 0
+                and (
+                    text[i - 1] in _STRONG_PUNCT
+                    or (text[i - 1] == "." and _is_strong_dot_boundary(text, i - 1))
+                )
+            ):
+                is_strong = True
             if is_strong:
                 seg = "".join(buf).strip()
                 if seg:
@@ -1631,6 +1703,25 @@ def _split_for_readability(raw_text: str, min_chars: int = 6, max_chars: int = 3
                 and text[idx + 1].isdigit()
             ):
                 continue
+            # Times, aspect ratios, URL schemes, host ports and compact
+            # key:value identifiers are atomic.  A colon without surrounding
+            # whitespace between ASCII characters is not a clause boundary.
+            if (
+                ch in {":", "："}
+                and idx > 0
+                and idx + 1 < len(text)
+                and (
+                    (text[idx - 1].isdigit() and text[idx + 1].isdigit())
+                    or (
+                        ch == ":"
+                        and text[idx - 1].isascii()
+                        and text[idx - 1].isalnum()
+                        and text[idx + 1].isascii()
+                        and (text[idx + 1].isalnum() or text[idx + 1] == "/")
+                    )
+                )
+            ):
+                continue
             if ch in weak_set:
                 seg = "".join(buf).strip()
                 if seg:
@@ -1642,6 +1733,20 @@ def _split_for_readability(raw_text: str, min_chars: int = 6, max_chars: int = 3
         return parts
 
     def _finalize_clause_lines(lines: List[str]) -> List[str]:
+        # Token packing may isolate an outer closing quote after sentence
+        # punctuation.  Attach it back before orphan repair so no subtitle is
+        # just "」" and no following subtitle starts with a dangling quote.
+        quote_fixed: List[str] = []
+        close_chars = "".join(re.escape(ch) for ch in _CLOSE_QUOTES)
+        for line in lines:
+            value = str(line or "").strip()
+            match = re.match(rf"^([。.!！？?]*[{close_chars}]+)(.*)$", value)
+            if match and quote_fixed:
+                quote_fixed[-1] = f"{quote_fixed[-1]}{match.group(1)}"
+                value = match.group(2).lstrip()
+            if value:
+                quote_fixed.append(value)
+        lines = quote_fixed
         lines = _repair_short_orphan_lines(lines, min_chars=min_chars, max_chars=max_chars)
         lines = _rebalance_short_neighbor_lines(lines, min_chars=min_chars, max_chars=max_chars)
         lines = _rebalance_short_english_lines(lines, min_words=1)
@@ -1668,7 +1773,10 @@ def _split_for_readability(raw_text: str, min_chars: int = 6, max_chars: int = 3
             cur = weak_clauses[i]
             while i + 1 < len(weak_clauses):
                 nxt = weak_clauses[i + 1]
-                combined = cur + nxt
+                # `_split_weak` trims surrounding whitespace.  Rejoin through
+                # the spacing-aware helper so English punctuation does not
+                # collapse "First, load" into "First,load".
+                combined = _smart_concat(cur, nxt)
                 cur_u = _units_once(cur)
                 nxt_u = _units_once(nxt)
                 # Weak punctuation is a semantic candidate boundary.
@@ -1706,6 +1814,18 @@ def _split_for_readability(raw_text: str, min_chars: int = 6, max_chars: int = 3
             toks = _tok_once(wc)
             clause_lines.extend(_pack_word_tokens(toks, min_chars=min_chars, max_chars=max_chars, unit_fn=_units_once))
         out_lines.extend(_finalize_clause_lines(clause_lines))
+    # Cross-clause safety pass.  Some token paths can still emit closing
+    # punctuation/quotes as a separate line; always attach them backward.
+    attached_lines: List[str] = []
+    close_chars = "".join(re.escape(ch) for ch in _CLOSE_QUOTES)
+    for line in out_lines:
+        value = str(line or "").strip()
+        match = re.match(rf"^([。.!！？?]*[{close_chars}]+)(.*)$", value)
+        if match and attached_lines:
+            attached_lines[-1] = f"{attached_lines[-1]}{match.group(1)}"
+            value = match.group(2).lstrip()
+        if value:
+            attached_lines.append(value)
     # Restore prior display rule: drop trailing weak/strong sentence punctuation
     # (，。!?;: etc.) but keep brackets/quotes untouched.
-    return [_strip_terminal_sentence_punct(x) for x in out_lines if x.strip()]
+    return [_strip_terminal_sentence_punct(x) for x in attached_lines if x.strip()]

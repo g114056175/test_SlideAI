@@ -26,9 +26,11 @@ export default defineConfig({
     sourcemap: false,
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ["vue", "vue-router"],
-          ui: ["vuetify", "bootstrap"],
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("/vue/") || id.includes("/vue-router/")) return "vendor";
+          if (id.includes("/vuetify/") || id.includes("/bootstrap/")) return "ui";
+          return undefined;
         },
       },
     },

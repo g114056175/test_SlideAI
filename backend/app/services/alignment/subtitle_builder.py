@@ -19,4 +19,3 @@ def build_srt(segments: List[Dict[str, Any]]) -> str:
         out.append(seg["text"])
         out.append("")
     return "\n".join(out)
-
