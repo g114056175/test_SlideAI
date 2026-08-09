@@ -182,7 +182,13 @@ compose() {
 }
 
 source_revision() {
-  git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || printf 'unknown'
+  # Hash only inputs that can affect an image.  Using the whole Git commit
+  # caused README/docs-only updates to re-export the multi-GB speech layer.
+  local input_hashes
+  input_hashes="$(git -C "${PROJECT_ROOT}" rev-parse \
+    HEAD:backend HEAD:frontend HEAD:shared HEAD:docker HEAD:deploy \
+    HEAD:docker-compose.yml 2>/dev/null)" || { printf 'unknown'; return; }
+  printf '%s\n' "${input_hashes}" | sha256sum | awk '{print $1}'
 }
 
 image_revision() {
