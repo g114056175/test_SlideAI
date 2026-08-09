@@ -33,8 +33,10 @@ def get_tts_provider_name() -> str:
     configured = os.getenv("SLIDEAI_TTS_PROVIDER", "").strip().lower()
     if configured:
         return configured
-    legacy = os.getenv("SLIDEAI_TTS_ENGINE", "voxcpm_nano").strip().lower()
-    return "qwen3" if legacy == "qwen3" else "voxcpm_nano"
+    legacy = os.getenv("SLIDEAI_TTS_ENGINE", "voxcpm").strip().lower()
+    if legacy == "qwen3":
+        return "qwen3"
+    return "voxcpm_nano" if legacy in {"voxcpm_nano", "nano_vllm"} else "voxcpm"
 
 
 def get_asr_provider_name() -> str:

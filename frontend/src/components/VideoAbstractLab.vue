@@ -556,7 +556,7 @@ const createDefaultGlobalSettings = () => ({
     outputMode: 'burn',
   },
   tts: {
-    model: 'voxcpm_nano',
+    model: 'voxcpm',
     voice: 'zh-TW-YunJheNeural',
     speed: 1.0,
   },

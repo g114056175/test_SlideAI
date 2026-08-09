@@ -116,7 +116,7 @@ class TextsRequest(BaseModel):
     texts: list[str]
     pdf_id: str
     resolution: int = 1080
-    tts_model: str = 'voxcpm_nano'
+    tts_model: str = 'voxcpm'
     voice: str = 'zh-TW-YunJheNeural'
     enable_subtitles: bool = True
     # 可擴充更多影片選項
@@ -1631,6 +1631,139 @@ class BatchRenderJobRequest(BaseModel):
     selected_voice_key: str = ""
     reference_text: str = ""
     subtitle_settings: dict = Field(default_factory=dict)
+    auto_merge: bool = False
+    transitions_enabled: bool = False
+
+
+class AgentVideoJobConfig(BaseModel):
+    """Stable, intentionally small contract for unattended PDF rendering."""
+
+    scripts: List[str]
+    reference_text: str
+    label: str = ""
+    subtitle_mode: str = "burn"  # none | srt | burn
+    tts_speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    selected_voice_key: str = "custom"
+    split_min_chars: int = Field(default=10, ge=4, le=80)
+    split_max_chars: int = Field(default=32, ge=8, le=120)
+    transitions_enabled: bool = False
+    subtitle_settings: dict = Field(default_factory=dict)
+
+
+@router.post("/api/agent/video-jobs", status_code=202)
+async def create_agent_video_job(
+    pdf: UploadFile = File(...),
+    reference_audio: UploadFile = File(...),
+    config_json: str = Form(...),
+):
+    """Submit PDF + reference voice + JSON and run the full video pipeline.
+
+    The caller supplies exactly one script per PDF page.  The endpoint creates
+    a persistent run, renders it through the shared FIFO GPU queue, and merges
+    the selected page videos automatically.  It therefore behaves exactly like
+    the WebUI pipeline without requiring a browser session.
+    """
+    try:
+        config = AgentVideoJobConfig.model_validate_json(config_json)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"config_json 格式錯誤：{exc}")
+
+    subtitle_mode = str(config.subtitle_mode or "burn").strip().lower()
+    if subtitle_mode not in {"none", "srt", "burn"}:
+        raise HTTPException(status_code=422, detail="subtitle_mode 必須是 none、srt 或 burn")
+    if config.split_min_chars > config.split_max_chars:
+        raise HTTPException(status_code=422, detail="split_min_chars 不可大於 split_max_chars")
+    if tts_requires_reference_text() and not config.reference_text.strip():
+        raise HTTPException(status_code=422, detail="VoxCPM2 語音克隆需要 reference_text")
+
+    pdf_bytes = await pdf.read()
+    if not pdf_bytes or not pdf_bytes.startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="pdf 必須是有效的 PDF 檔案")
+    if len(pdf_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"PDF 不可超過 {MAX_FILE_SIZE // 1024 // 1024}MB")
+    reference_bytes = await reference_audio.read()
+    if not reference_bytes:
+        raise HTTPException(status_code=400, detail="reference_audio 不可為空")
+
+    try:
+        page_count = len(PyPDF2.PdfReader(io.BytesIO(pdf_bytes)).pages)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"PDF 解析失敗：{exc}")
+    scripts = [str(item or "").strip() for item in config.scripts]
+    if len(scripts) != page_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"scripts 必須與 PDF 頁數一致（PDF={page_count}，scripts={len(scripts)}）",
+        )
+    empty_pages = [index + 1 for index, text in enumerate(scripts) if not text]
+    if empty_pages:
+        raise HTTPException(status_code=422, detail=f"scripts 不可留空；空白頁：{empty_pages[:20]}")
+
+    store = get_video_run_store()
+    workspace = tempfile.mkdtemp(prefix="slideai_agent_submit_")
+    try:
+        source_path = Path(workspace) / "source.pdf"
+        source_path.write_bytes(pdf_bytes)
+        manifest = store.create_run(
+            pdf_path=source_path,
+            original_filename=pdf.filename or "agent-input.pdf",
+            scripts=scripts,
+            settings={"agent_request": config.model_dump()},
+            source="agent-api",
+        )
+        run_id = str(manifest["run_id"])
+        store.update_settings(
+            run_id,
+            {
+                "selected_voice_key": config.selected_voice_key,
+                "reference_text": config.reference_text,
+                "tts_speed": config.tts_speed,
+                "subtitle_mode": subtitle_mode,
+                "subtitle": config.subtitle_settings,
+                "has_reference_audio": True,
+            },
+            reference_audio=reference_bytes,
+            reference_audio_name=reference_audio.filename or "reference.wav",
+        )
+        # The browser normally has time to create these while the user edits
+        # scripts.  An agent submits immediately, so prepare all page images
+        # before allowing the GPU job to start and avoid an asset race.
+        persisted_pdf = str((store.load_manifest(run_id).get("paths") or {}).get("pdf") or "")
+        await asyncio.to_thread(_pregenerate_run_thumbnails_safe, run_id, persisted_pdf)
+        job = store.create_job(
+            run_id=run_id,
+            payload=BatchRenderJobRequest(
+                page_indexes=list(range(page_count)),
+                subtitle_mode=subtitle_mode,
+                split_min_chars=config.split_min_chars,
+                split_max_chars=config.split_max_chars,
+                tts_speed=config.tts_speed,
+                selected_voice_key=config.selected_voice_key,
+                reference_text=config.reference_text,
+                subtitle_settings=config.subtitle_settings,
+                auto_merge=True,
+                transitions_enabled=config.transitions_enabled,
+            ).model_dump(),
+        )
+        job_id = str(job["job_id"])
+        _start_batch_job_task(run_id, job_id)
+        return JSONResponse(
+            {
+                "run_id": run_id,
+                "job_id": job_id,
+                "status": "queued",
+                "status_url": f"/api/agent/video-jobs/{run_id}/{job_id}",
+                "cancel_url": f"/api/video-runs/{run_id}/jobs/{job_id}/cancel",
+            },
+            status_code=202,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[Agent API] submit failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"建立 Agent 影片任務失敗：{exc}")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 _BATCH_JOB_TASKS: dict[str, asyncio.Task] = {}
@@ -1905,11 +2038,52 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                     },
                 )
 
+            result: dict = {}
+            if bool(payload.get("auto_merge")):
+                store.update_job(
+                    run_id=run_id,
+                    job_id=job_id,
+                    updates={
+                        "stage": "merge", "stage_index": 0, "stage_total": 1,
+                        "current_page_index": None,
+                    },
+                )
+                latest_job = store.load_job(run_id=run_id, job_id=job_id)
+                variant_ids = {
+                    str(page_index): str(
+                        ((latest_job.get("pages") or {}).get(str(page_index), {}) or {}).get("variant_id") or ""
+                    )
+                    for page_index in page_indexes
+                }
+                from backend.app.api.video_runs import merge_selected_video_run_variants
+
+                merge_response = await merge_selected_video_run_variants(
+                    run_id=run_id,
+                    page_indexes_json=json.dumps(page_indexes),
+                    variant_ids_json=json.dumps(variant_ids),
+                    response_mode="json",
+                    transitions_enabled=bool(payload.get("transitions_enabled")),
+                )
+                merge_data = json.loads(bytes(merge_response.body).decode("utf-8"))
+                export_id = str(merge_data.get("export_variant_id") or "")
+                if not export_id:
+                    raise RuntimeError("自動合併完成但沒有 export_variant_id")
+                result = {
+                    "export_variant_id": export_id,
+                    "video_url": f"/api/video-runs/{run_id}/exports/{export_id}/video",
+                    "srt_url": (
+                        f"/api/video-runs/{run_id}/exports/{export_id}/subtitles.srt"
+                        if subtitle_mode != "none" else ""
+                    ),
+                    "bundle_url": f"/api/video-runs/{run_id}/exports/{export_id}/download.zip",
+                }
+
             store.update_job(
                 run_id=run_id, job_id=job_id,
                 updates={
                     "status": "completed", "stage": "completed", "stage_index": len(page_indexes),
-                    "stage_total": len(page_indexes), "current_page_index": None, "cancel_requested": False,
+                    "stage_total": len(page_indexes), "current_page_index": None,
+                    "cancel_requested": False, "result": result,
                 },
             )
     except asyncio.CancelledError:
@@ -1979,6 +2153,28 @@ async def get_batch_render_job(run_id: str, job_id: str):
         return JSONResponse({**job, "queue": _batch_queue_metadata(run_id, job_id)})
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Job not found")
+
+
+@router.get("/api/agent/video-jobs/{run_id}/{job_id}")
+async def get_agent_video_job(run_id: str, job_id: str):
+    """Agent-oriented job status with stable artifact URLs on completion."""
+    try:
+        job = get_video_run_store().load_job(run_id=run_id, job_id=job_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Agent video job not found")
+    result = dict(job.get("result") or {})
+    return JSONResponse({
+        "run_id": run_id,
+        "job_id": job_id,
+        "status": job.get("status"),
+        "stage": job.get("stage"),
+        "stage_index": job.get("stage_index", 0),
+        "stage_total": job.get("stage_total", 0),
+        "current_page_index": job.get("current_page_index"),
+        "queue": _batch_queue_metadata(run_id, job_id),
+        "error": job.get("error", ""),
+        "result": result,
+    })
 
 
 @router.get("/api/video-runs/{run_id}/jobs-current")

@@ -11,6 +11,8 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
+      args:
+        INSTALL_VOXCPM_NANO: ${VOXTTS_INSTALL_NANO:-0}
     gpus: all
     restart: unless-stopped
     logging: *default-logging
@@ -23,16 +25,16 @@ services:
       FRONTEND_URL: http://localhost:${FRONTEND_PORT:-5174}
       VIDEO_ABSTRACT_LOCAL_ONLY: ${VIDEO_ABSTRACT_LOCAL_ONLY:-true}
       SLIDEAI_MODELS_DIR: /models
-      SLIDEAI_TTS_PROVIDER: ${SLIDEAI_TTS_PROVIDER:-voxcpm_nano}
+      SLIDEAI_TTS_PROVIDER: ${SLIDEAI_TTS_PROVIDER:-voxcpm}
       SLIDEAI_ASR_PROVIDER: ${SLIDEAI_ASR_PROVIDER:-qwen3}
       SLIDEAI_ALIGNMENT_PROVIDER: ${SLIDEAI_ALIGNMENT_PROVIDER:-qwen3}
       VOXTTS_MODEL_PATH: /models/tts/VoxCPM2
       QWEN3_TTS_MODEL_PATH: /models/tts/Qwen3-TTS-12Hz-1.7B-Base
       QWEN3_ASR_MODEL_PATH: /models/asr/Qwen3-ASR-1.7B
       QWEN3_ALIGNER_MODEL_PATH: /models/alignment/Qwen3-ForcedAligner-0.6B
-      VOXTTS_ENGINE: nano_vllm
+      VOXTTS_ENGINE: ${VOXTTS_ENGINE:-original}
       VOXTTS_NANO_WORKER_PATH: /app/backend/app/workers/nano_voxcpm_worker.py
-      VOXTTS_RUNTIME_PYTHON: /opt/slideai/voxcpm-nano/bin/python
+      VOXTTS_RUNTIME_PYTHON: ${VOXTTS_RUNTIME_PYTHON_CONTAINER:-/opt/slideai/voxcpm/bin/python}
       QWEN3_TTS_RUNTIME_PYTHON: /opt/slideai/qwen-speech/bin/python
       QWEN3_ASR_RUNTIME_PYTHON: /opt/slideai/qwen-speech/bin/python
       VOXTTS_NANO_TIMESTEPS: ${VOXTTS_NANO_TIMESTEPS:-12}

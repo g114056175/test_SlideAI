@@ -29,7 +29,8 @@ models/
 └── alignment/Qwen3-ForcedAligner-0.6B/
 ```
 
-The default demo uses Nano-vLLM VoxCPM2, Qwen3-ASR and Qwen3 ForcedAligner.
+The portable default uses official VoxCPM2, Qwen3-ASR and Qwen3 ForcedAligner.
+Nano-vLLM is an explicit optional acceleration profile selected during setup.
 All three providers can be replaced independently without changing frontend
 routes; see `docs/SPEECH_ADAPTERS.md`.
 

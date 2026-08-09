@@ -60,7 +60,7 @@ def load_voxtts_config() -> VoxTTSConfig:
         ).strip(),
         runtime_python=os.getenv(
             "VOXTTS_RUNTIME_PYTHON",
-            str(DEFAULT_RUNTIMES_DIR / "voxcpm-nano" / ".venv" / "bin" / "python"),
+            str(DEFAULT_RUNTIMES_DIR / "voxcpm" / ".venv" / "bin" / "python"),
         ).strip(),
         optimize=_to_bool(os.getenv("VOXTTS_OPTIMIZE"), False),
         infer_timeout_sec=int(os.getenv("VOXTTS_INFER_TIMEOUT_SEC", "600")),
@@ -75,7 +75,7 @@ def load_voxtts_config() -> VoxTTSConfig:
         asr_timeout_sec=int(os.getenv("QWEN3_ASR_TIMEOUT_SEC", "600")),
         text_split_mode=DEFAULT_VOX_TEXT_SPLIT_MODE,
         edge_silence_ms=DEFAULT_VOX_EDGE_SILENCE_MS,
-        engine=os.getenv("VOXTTS_ENGINE", "nano_vllm").strip().lower(),
+        engine=os.getenv("VOXTTS_ENGINE", "original").strip().lower(),
         nano_worker_path=os.getenv(
             "VOXTTS_NANO_WORKER_PATH",
             str(PROJECT_ROOT / "backend" / "app" / "workers" / "nano_voxcpm_worker.py"),
@@ -434,8 +434,17 @@ def _run_voxtts_infer(
             reference_audio_path=reference_audio_path, auxiliary_text=auxiliary_text,
         )
 
+    chunks = build_voxtts_text_chunks(final_text, config.text_split_mode)
+    if not chunks:
+        return False, None, "no text chunks generated"
+    part_paths: list[str] = []
+    for index in range(len(chunks)):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".part{index + 1:03d}.wav") as part_fp:
+            part_paths.append(part_fp.name)
+    silence_ms = max(0.0, config.edge_silence_ms)
     script = textwrap.dedent(f"""
 import json
+import numpy as np
 import soundfile as sf
 from voxcpm import VoxCPM
 
@@ -446,9 +455,8 @@ model = VoxCPM.from_pretrained(
 )
 
 kwargs = dict(
-    text={_py_literal(final_text)},
     cfg_value=2.0,
-    inference_timesteps=12,
+    inference_timesteps={_py_literal(config.nano_timesteps)},
     normalize=False,
     denoise=True,
 )
@@ -463,10 +471,21 @@ if use_prompt and reference_audio:
     kwargs["prompt_wav_path"] = reference_audio
     kwargs["prompt_text"] = aux_text
 
-wav = model.generate(**kwargs)
-sf.write({_py_literal(output_path)}, wav, model.tts_model.sample_rate)
+texts = {_py_literal(chunks)}
+part_paths = {_py_literal(part_paths)}
+silence_ms = {_py_literal(silence_ms)}
+parts = []
+for index, chunk in enumerate(texts):
+    kwargs["text"] = chunk
+    wav = model.generate(**kwargs)
+    sf.write(part_paths[index], wav, model.tts_model.sample_rate)
+    parts.append(wav)
+    if index < len(texts) - 1 and silence_ms > 0:
+        parts.append(np.zeros(int(model.tts_model.sample_rate * silence_ms / 1000.0), dtype=np.float32))
+sf.write({_py_literal(output_path)}, np.concatenate(parts), model.tts_model.sample_rate)
 print(json.dumps({{"output_path": {_py_literal(output_path)}}}, ensure_ascii=False))
 """)
+    _release_competing_speech_workers()
     try:
         proc = subprocess.run(
             [config.runtime_python, "-c", script],
@@ -475,12 +494,28 @@ print(json.dumps({{"output_path": {_py_literal(output_path)}}}, ensure_ascii=Fal
             timeout=config.infer_timeout_sec,
         )
     except Exception as exc:
+        for part_path in part_paths:
+            Path(part_path).unlink(missing_ok=True)
         return False, None, str(exc)
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "voxtts infer failed").strip()
+        for part_path in part_paths:
+            Path(part_path).unlink(missing_ok=True)
         return False, None, msg[:1200]
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        for part_path in part_paths:
+            Path(part_path).unlink(missing_ok=True)
         return False, None, "voxtts finished but no audio produced"
+    try:
+        _persist_chunk_artifacts(
+            output_path=output_path,
+            chunks=chunks,
+            part_paths=part_paths,
+            silence_ms=silence_ms,
+        )
+    finally:
+        for part_path in part_paths:
+            Path(part_path).unlink(missing_ok=True)
     return True, output_path, "ok"
 
 

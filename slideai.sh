@@ -346,10 +346,15 @@ start_basic_services() {
 check_native_runtimes() {
   local nano_python="${VOXTTS_RUNTIME_PYTHON_HOST_PATH:-}"
   local qwen_python="${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH:-}"
-  [[ -x "${nano_python}" ]] || { warn "Nano runtime Python 不存在：${nano_python:-<未設定>}"; return 1; }
+  local tts_engine="${VOXTTS_ENGINE:-original}" tts_module="voxcpm" tts_label="VoxCPM"
+  if [[ "${tts_engine}" == "nano_vllm" ]]; then
+    tts_module="nanovllm_voxcpm"
+    tts_label="Nano-vLLM VoxCPM"
+  fi
+  [[ -x "${nano_python}" ]] || { warn "${tts_label} runtime Python 不存在：${nano_python:-<未設定>}"; return 1; }
   [[ -x "${qwen_python}" ]] || { warn "Qwen runtime Python 不存在：${qwen_python:-<未設定>}"; return 1; }
-  "${nano_python}" -c 'import nanovllm_voxcpm' >/dev/null 2>&1 \
-    || { warn "Nano runtime 無法匯入 nanovllm_voxcpm。"; return 1; }
+  "${nano_python}" -c "import ${tts_module}" >/dev/null 2>&1 \
+    || { warn "${tts_label} runtime 無法匯入 ${tts_module}。"; return 1; }
   "${qwen_python}" -c 'import qwen_asr' >/dev/null 2>&1 \
     || { warn "Qwen runtime 無法匯入 qwen_asr。"; return 1; }
 }
@@ -374,7 +379,6 @@ start_native_services() {
     export QWEN3_ASR_MODEL_PATH="$(absolute_path "${QWEN3_ASR_MODEL_HOST_PATH}")"
     export QWEN3_ALIGNER_MODEL_PATH="$(absolute_path "${QWEN3_ALIGNER_MODEL_HOST_PATH}")"
     export QWEN3_TTS_MODEL_PATH="$(absolute_path "${QWEN3_TTS_MODEL_HOST_PATH}")"
-    export VOXTTS_ENGINE=nano_vllm
     export VOXTTS_RUNTIME_PYTHON="${VOXTTS_RUNTIME_PYTHON_HOST_PATH}"
     export QWEN3_ASR_RUNTIME_PYTHON="${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH}"
     export QWEN3_TTS_RUNTIME_PYTHON="${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH}"
@@ -492,11 +496,11 @@ host_preflight() {
     gpu_memory_mb="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ')"
     ok "NVIDIA GPU：${gpu_name:-detected}（driver ${driver_version:-unknown}，VRAM ${gpu_memory_mb:-unknown}MB）"
     if [[ "${gpu_memory_mb}" =~ ^[0-9]+$ ]] && (( gpu_memory_mb < 14000 )); then
-      warn "VRAM 低於約 14GB；預設 VoxCPM Nano 可能需要降低 GPU memory utilization、縮短文本或改用其他 TTS。"
+      warn "VRAM 低於約 14GB；VoxCPM、ASR 或強制對齊可能需要縮短文本並避免其他 GPU 工作同時運行。"
     fi
   else
     warn "未偵測到可用的 NVIDIA driver/GPU。"
-    warn "前後端映像仍可建置，但目前 VoxCPM Nano、Qwen ASR 與強制對齊映像不保證可在 CPU/AMD GPU 執行。"
+    warn "前後端映像仍可建置，但目前 VoxCPM、Qwen ASR 與強制對齊不保證可在 CPU/AMD GPU 執行。"
   fi
 }
 
@@ -803,12 +807,67 @@ EOF
   fi
 }
 
+configure_tts_engine() {
+  ensure_config_files
+  local current choice runtime_path deploy_mode
+  current="$(env_value "${MODEL_ENV}" VOXTTS_ENGINE 2>/dev/null || printf 'original')"
+  deploy_mode="$(env_value "${MODEL_ENV}" SLIDEAI_DEPLOY_MODE 2>/dev/null || printf 'docker')"
+  line
+  say "VoxCPM2 執行方式（目前：${current}）"
+  cat <<'EOF'
+  1) 官方 VoxCPM2（預設／建議）
+     相容性較高、環境較單純、顯存配置較自然，但生成速度較慢。
+  2) Nano-vLLM 加速（選用）
+     RTX 5090 長文本約可到 0.11–0.13 RTF；會增加一套 Torch、
+     FlashAttention 與 CUDA 相依環境，映像更大，舊 GPU／驅動相容性較嚴格，
+     且 vLLM 會預留設定比例的顯存。
+  0) 保留目前設定
+EOF
+  read -r -p "請選擇 [0-2]：" choice
+  case "${choice}" in
+    1)
+      set_env_value "${MODEL_ENV}" SLIDEAI_TTS_PROVIDER voxcpm
+      set_env_value "${MODEL_ENV}" VOXTTS_ENGINE original
+      set_env_value "${MODEL_ENV}" VOXTTS_INSTALL_NANO 0
+      set_env_value "${MODEL_ENV}" VOXTTS_RUNTIME_PYTHON_CONTAINER /opt/slideai/voxcpm/bin/python
+      ok "已選擇官方 VoxCPM2；Docker 不會建置 Nano-vLLM 環境。"
+      ;;
+    2)
+      confirm "確定額外建置 Nano-vLLM／FlashAttention 加速環境？" no \
+        || { skip "Nano-vLLM 設定"; return 0; }
+      set_env_value "${MODEL_ENV}" SLIDEAI_TTS_PROVIDER voxcpm_nano
+      set_env_value "${MODEL_ENV}" VOXTTS_ENGINE nano_vllm
+      set_env_value "${MODEL_ENV}" VOXTTS_INSTALL_NANO 1
+      set_env_value "${MODEL_ENV}" VOXTTS_RUNTIME_PYTHON_CONTAINER /opt/slideai/voxcpm-nano/bin/python
+      ok "已選擇 Nano-vLLM；下次 Docker build 會加入加速環境。"
+      ;;
+    0|"") return 0 ;;
+    *) warn "無效選項。"; return 1 ;;
+  esac
+
+  if [[ "${deploy_mode}" == "native" ]]; then
+    runtime_path="$(env_value "${MODEL_ENV}" VOXTTS_RUNTIME_PYTHON_HOST_PATH 2>/dev/null || true)"
+    read -r -p "Native TTS Python 路徑 [${runtime_path}]：" runtime_path
+    if [[ -n "${runtime_path}" ]]; then
+      set_env_value "${MODEL_ENV}" VOXTTS_RUNTIME_PYTHON_HOST_PATH "${runtime_path}"
+    else
+      warn "Native 模式仍需在『5 設定』指定可匯入對應 TTS 套件的 Python。"
+    fi
+  fi
+}
+
 configure_runtime() {
   ensure_config_files
-  local timesteps memory idle align_idle
+  local timesteps memory idle align_idle engine
+  engine="$(env_value "${MODEL_ENV}" VOXTTS_ENGINE 2>/dev/null || printf 'original')"
   read -r -p "VoxCPM inference timesteps [12]：" timesteps
-  read -r -p "Nano-vLLM GPU memory utilization [0.50]：" memory
-  read -r -p "TTS 閒置卸載秒數 [120]：" idle
+  if [[ "${engine}" == "nano_vllm" ]]; then
+    read -r -p "Nano-vLLM GPU memory utilization [0.50]：" memory
+    read -r -p "Nano-vLLM 閒置卸載秒數 [120]：" idle
+  else
+    memory="$(env_value "${MODEL_ENV}" VOXTTS_NANO_GPU_MEMORY_UTILIZATION 2>/dev/null || printf '0.50')"
+    idle="$(env_value "${MODEL_ENV}" VOXTTS_NANO_IDLE_TIMEOUT_SEC 2>/dev/null || printf '120')"
+  fi
   read -r -p "強制對齊閒置卸載秒數 [60]：" align_idle
   timesteps="${timesteps:-12}"; memory="${memory:-0.50}"
   idle="${idle:-120}"; align_idle="${align_idle:-60}"
@@ -840,7 +899,10 @@ EOF
     read -r -p "請選擇 [0-6]：" choice
     case "${choice}" in
       1) configure_deployment || true ;;
-      2) model_wizard "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE "./models/tts/VoxCPM2" 0 || true ;;
+      2)
+        model_wizard "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE "./models/tts/VoxCPM2" 0 || true
+        configure_tts_engine || true
+        ;;
       3) model_wizard "Qwen3 ASR" QWEN3_ASR_MODEL_HOST_PATH QWEN3_ASR_SOURCE "./models/asr/Qwen3-ASR-1.7B" 0 || true ;;
       4) model_wizard "Qwen3 ForcedAligner" QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_ALIGNER_SOURCE "./models/alignment/Qwen3-ForcedAligner-0.6B" 0 || true ;;
       5) llm_wizard || true ;;
@@ -939,22 +1001,25 @@ build_wizard() {
     confirm "是否仍繼續嘗試建置基本前後端？" no || return 1
   }
 
-  say "步驟 1/5：前後端與 Docker"
+  say "步驟 1/6：選擇 TTS 執行方式"
+  configure_tts_engine || warn "沿用目前 TTS 執行方式。"
+
+  line; say "步驟 2/6：前後端與 Docker"
   build_frontend_backend || warn "前後端環境尚未完成，繼續檢查其他項目。"
 
-  line; say "步驟 2/5：TTS"
+  line; say "步驟 3/6：TTS 模型"
   model_wizard "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE "./models/tts/VoxCPM2" 0 || warn "TTS 尚未完成。"
 
-  line; say "步驟 3/5：ASR"
+  line; say "步驟 4/6：ASR"
   model_wizard "Qwen3 ASR" QWEN3_ASR_MODEL_HOST_PATH QWEN3_ASR_SOURCE "./models/asr/Qwen3-ASR-1.7B" 0 || warn "ASR 尚未完成。"
 
-  line; say "步驟 4/5：強制對齊"
+  line; say "步驟 5/6：強制對齊"
   model_wizard "Qwen3 ForcedAligner" QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_ALIGNER_SOURCE "./models/alignment/Qwen3-ForcedAligner-0.6B" 0 || warn "強制對齊尚未完成。"
   if confirm "是否也設定選用的 Qwen3 TTS？" no; then
     model_wizard "Qwen3 TTS（選用）" QWEN3_TTS_MODEL_HOST_PATH QWEN3_TTS_SOURCE "./models/tts/Qwen3-TTS-12Hz-1.7B-Base" 1 || true
   fi
 
-  line; say "步驟 5/5：LLM API"
+  line; say "步驟 6/6：LLM API"
   llm_wizard || warn "LLM API 尚未完成；選擇『無』模式時仍可進入基本流程。"
 
   line
@@ -1028,12 +1093,20 @@ EOF
 
   line; say "執行環境"
   if [[ "${SLIDEAI_DEPLOY_MODE:-docker}" == "native" ]]; then
-    runtime_status "VoxCPM Nano" "${VOXTTS_RUNTIME_PYTHON_HOST_PATH:-}" nanovllm_voxcpm
+    if [[ "${VOXTTS_ENGINE:-original}" == "nano_vllm" ]]; then
+      runtime_status "VoxCPM Nano-vLLM" "${VOXTTS_RUNTIME_PYTHON_HOST_PATH:-}" nanovllm_voxcpm
+    else
+      runtime_status "官方 VoxCPM" "${VOXTTS_RUNTIME_PYTHON_HOST_PATH:-}" voxcpm
+    fi
     runtime_status "Qwen Speech" "${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH:-}" qwen_asr
     [[ -x "${PROJECT_ROOT}/backend/.venv/bin/python" ]] && ok "Backend venv" || warn "Backend venv 缺少"
     [[ -d "${PROJECT_ROOT}/frontend/node_modules" ]] && ok "Frontend node_modules" || warn "Frontend node_modules 缺少"
   else
-    info "Docker 模式：Backend、VoxCPM Nano、Qwen Speech 環境由映像提供"
+    if [[ "${VOXTTS_ENGINE:-original}" == "nano_vllm" ]]; then
+      info "Docker 模式：官方 VoxCPM + Nano-vLLM（選用加速）+ Qwen Speech"
+    else
+      info "Docker 模式：官方 VoxCPM + Qwen Speech（未安裝 Nano-vLLM）"
+    fi
   fi
 
   line; say "LLM"

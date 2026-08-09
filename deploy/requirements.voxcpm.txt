@@ -1,0 +1,2 @@
+# Official VoxCPM source pinned to the revision validated by this project.
+git+https://github.com/OpenBMB/VoxCPM.git@cd79a647fab96f11a1c7f350cec11385b011ede4

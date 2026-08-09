@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1.7
 # SlideAI Ubuntu/NVIDIA image. PyTorch cu130 wheels provide the CUDA userspace
 # libraries; NVIDIA Container Toolkit injects the host driver at runtime.
-# TTS and Qwen speech stay in separate Python environments because their
-# Torch/Transformers versions are incompatible.
+# VoxCPM and Qwen speech stay in separate Python environments.  Nano-vLLM is
+# an optional third environment because its Torch/FlashAttention constraints
+# are stricter than the official VoxCPM runtime.
 FROM ubuntu:24.04
+
+ARG INSTALL_VOXCPM_NANO=0
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -13,23 +16,31 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ca-certificates ffmpeg fontconfig fonts-noto-cjk libsndfile1 \
+       ca-certificates ffmpeg fontconfig fonts-noto-cjk git libsndfile1 \
        poppler-utils python3.12 python3.12-venv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt /tmp/backend-requirements.txt
+COPY deploy/requirements.voxcpm.txt /tmp/voxcpm-original-requirements.txt
 COPY deploy/requirements.voxcpm-nano.txt /tmp/voxcpm-requirements.txt
 COPY deploy/requirements.qwen-speech.txt /tmp/qwen-requirements.txt
 
 RUN python3.12 -m venv /opt/slideai/backend \
     && /opt/slideai/backend/bin/pip install -r /tmp/backend-requirements.txt \
-    && python3.12 -m venv /opt/slideai/voxcpm-nano \
-    && /opt/slideai/voxcpm-nano/bin/pip install \
-       torch==2.9.0 torchaudio==2.9.0 \
+    && python3.12 -m venv /opt/slideai/voxcpm \
+    && /opt/slideai/voxcpm/bin/pip install \
+       torch==2.11.0 torchaudio==2.11.0 \
        --index-url https://download.pytorch.org/whl/cu130 \
-    && /opt/slideai/voxcpm-nano/bin/pip install \
-       "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3%2Bcu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" \
-    && /opt/slideai/voxcpm-nano/bin/pip install -r /tmp/voxcpm-requirements.txt \
+    && /opt/slideai/voxcpm/bin/pip install -r /tmp/voxcpm-original-requirements.txt \
+    && if [ "${INSTALL_VOXCPM_NANO}" = "1" ]; then \
+         python3.12 -m venv /opt/slideai/voxcpm-nano \
+         && /opt/slideai/voxcpm-nano/bin/pip install \
+            torch==2.9.0 torchaudio==2.9.0 \
+            --index-url https://download.pytorch.org/whl/cu130 \
+         && /opt/slideai/voxcpm-nano/bin/pip install \
+            "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3%2Bcu13torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" \
+         && /opt/slideai/voxcpm-nano/bin/pip install -r /tmp/voxcpm-requirements.txt; \
+       fi \
     && python3.12 -m venv /opt/slideai/qwen-speech \
     && /opt/slideai/qwen-speech/bin/pip install \
        torch==2.11.0 torchaudio==2.11.0 \
@@ -41,7 +52,7 @@ RUN mkdir -p /app/data/database /app/data/video_runs /models
 
 ENV PATH=/opt/slideai/backend/bin:$PATH \
     VOXTTS_NANO_WORKER_PATH=/app/backend/app/workers/nano_voxcpm_worker.py \
-    VOXTTS_RUNTIME_PYTHON=/opt/slideai/voxcpm-nano/bin/python \
+    VOXTTS_RUNTIME_PYTHON=/opt/slideai/voxcpm/bin/python \
     QWEN3_TTS_RUNTIME_PYTHON=/opt/slideai/qwen-speech/bin/python \
     QWEN3_ASR_RUNTIME_PYTHON=/opt/slideai/qwen-speech/bin/python
 

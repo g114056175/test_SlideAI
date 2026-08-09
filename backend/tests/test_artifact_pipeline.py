@@ -1,4 +1,6 @@
 import json
+import asyncio
+import io
 import tempfile
 import threading
 import unittest
@@ -8,6 +10,8 @@ from unittest.mock import patch
 import numpy as np
 import soundfile as sf
 from PIL import Image
+from fastapi import UploadFile
+from pypdf import PdfWriter
 
 from backend.app.api import video
 from backend.app.services.artifact_store import VideoRunStore
@@ -91,7 +95,43 @@ class ArtifactPipelineTests(unittest.TestCase):
             patch.object(video, "convert_from_path", return_value=[image]),
         ):
             video._pregenerate_run_thumbnails_safe(self.run_id, str(self.pdf))
-        self.assertFalse(self.store.run_dir(self.run_id).exists())
+            self.assertFalse(self.store.run_dir(self.run_id).exists())
+
+    def test_agent_submission_requires_one_script_per_page_and_queues_auto_merge(self):
+        pdf_buffer = io.BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=1280, height=720)
+        writer.add_blank_page(width=1280, height=720)
+        writer.write(pdf_buffer)
+        pdf_buffer.seek(0)
+        queued = []
+        config = {
+            "scripts": ["第一頁講稿。", "第二頁講稿。"],
+            "reference_text": "這是參考音檔的逐字稿。",
+            "subtitle_mode": "none",
+            "tts_speed": 1.0,
+            "transitions_enabled": True,
+        }
+        with (
+            patch.object(video, "get_video_run_store", return_value=self.store),
+            patch.object(video, "_pregenerate_run_thumbnails_safe", return_value=None),
+            patch.object(video, "_start_batch_job_task", side_effect=lambda run_id, job_id: queued.append((run_id, job_id))),
+        ):
+            response = asyncio.run(video.create_agent_video_job(
+                pdf=UploadFile(filename="agent.pdf", file=pdf_buffer),
+                reference_audio=UploadFile(filename="voice.wav", file=io.BytesIO(b"RIFF-reference")),
+                config_json=json.dumps(config, ensure_ascii=False),
+            ))
+        body = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(len(queued), 1)
+        job = self.store.load_job(run_id=body["run_id"], job_id=body["job_id"])
+        self.assertTrue(job["payload"]["auto_merge"])
+        self.assertTrue(job["payload"]["transitions_enabled"])
+        self.assertEqual(job["payload"]["page_indexes"], [0, 1])
+        manifest = self.store.load_manifest(body["run_id"])
+        self.assertEqual([page["script"] for page in manifest["pages"]], config["scripts"])
+        self.assertTrue(Path(manifest["settings"]["current"]["reference_audio"]["path"]).is_file())
 
     def test_five_batch_jobs_recover_in_fifo_order_and_report_positions(self):
         jobs = []

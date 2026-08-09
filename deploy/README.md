@@ -33,7 +33,7 @@ QWEN3_ASR_SOURCE=hf:Qwen/Qwen3-ASR-1.7B
 
 ```dotenv
 SLIDEAI_DEPLOY_MODE=native
-VOXTTS_RUNTIME_PYTHON_HOST_PATH=/opt/voxcpm-nano/.venv/bin/python
+VOXTTS_RUNTIME_PYTHON_HOST_PATH=/opt/voxcpm/.venv/bin/python
 QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH=/opt/qwen-speech/.venv/bin/python
 ```
 
@@ -63,11 +63,14 @@ docker/
     └── nginx.conf
 ```
 
-後端映像內有三個隔離環境：
+後端映像預設有三個隔離環境：
 
 - 精簡 FastAPI backend；
-- CUDA 13／Torch 2.9／Nano-vLLM VoxCPM；
+- CUDA 13／Torch 2.11／官方 VoxCPM；
 - Torch 2.11／Qwen ASR、TTS 與 ForcedAligner。
+
+只有在 `slideai.sh` 建制精靈明確選擇 Nano-vLLM 時，才會額外建立 Torch
+2.9／FlashAttention／Nano-vLLM 環境。一般設備不需要這一層。
 
 模型不會寫入映像，而是從主機唯讀掛載，因此更新程式不需重新複製模型。
 服務日誌由 Docker 管理，每個容器最多保留 3 份、每份 10MB；前端 access
@@ -87,7 +90,8 @@ TTS、ASR、強制對齊各自有 provider。若改用商用服務，把對應 p
 - 可使用 NVIDIA GPU 的驅動；
 - Docker Engine、Compose v2；
 - NVIDIA Container Toolkit；
-- 目前 Nano 映像鎖定 Linux x86_64、PyTorch cu130／Torch 2.9。
+- 官方 VoxCPM 映像使用 PyTorch cu130／Torch 2.11；選用 Nano-vLLM 時另加
+  Torch 2.9 與對應 FlashAttention wheel，目前皆鎖定 Linux x86-64。
 
 4060 Ti 等較舊架構仍可使用 cu130 wheel，但主機驅動必須足夠新。GPU
 driver 由 NVIDIA Container Toolkit 注入；映像不再重複包含完整 CUDA

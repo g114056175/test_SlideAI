@@ -1,0 +1,22 @@
+{
+  "scripts": [
+    "第一頁的完整講稿。",
+    "第二頁的完整講稿。"
+  ],
+  "reference_text": "參考聲音檔案中實際念出的逐字稿。",
+  "label": "agent-demo",
+  "subtitle_mode": "burn",
+  "tts_speed": 1.0,
+  "selected_voice_key": "custom",
+  "split_min_chars": 10,
+  "split_max_chars": 32,
+  "transitions_enabled": false,
+  "subtitle_settings": {
+    "font_size": 52,
+    "margin_v": 90,
+    "enable_background": true,
+    "bg_color": "#000000",
+    "bg_opacity": 55,
+    "enable_highlight": false
+  }
+}
