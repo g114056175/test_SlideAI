@@ -600,10 +600,13 @@ model_ready() {
 }
 
 hf_download() {
-  local repository="$1" target="$2"
+  local repository="$1" target="$2" downloader_venv="${RUNTIME_DIR}/hf-downloader"
   mkdir -p "${target}"
+  if [[ -z "${HF_TOKEN:-}" ]]; then
+    info "未設定 HF_TOKEN；公開模型仍可匿名下載，但速率限制會較低。"
+  fi
   if command -v hf >/dev/null 2>&1; then
-    hf download "${repository}" --local-dir "${target}"
+    HF_HUB_DISABLE_TELEMETRY=1 hf download "${repository}" --local-dir "${target}"
     return
   fi
   if docker_access; then
@@ -611,13 +614,33 @@ hf_download() {
     "${DOCKER[@]}" run --rm \
       --user "$(id -u):$(id -g)" \
       -e HF_REPO="${repository}" \
-      -e HF_TOKEN \
+      -e HF_TOKEN="${HF_TOKEN:-}" \
+      -e HF_HUB_DISABLE_TELEMETRY=1 \
       -v "${target}:/download" \
       python:3.12-slim \
       sh -c 'python -m pip install --quiet --no-cache-dir huggingface_hub && hf download "$HF_REPO" --local-dir /download'
     return
   fi
-  warn "自動下載需要 hf CLI 或可用的 Docker。"
+
+  if command -v python3 >/dev/null 2>&1; then
+    info "Docker 目前不可用，建立專案內輕量 Hugging Face 下載器。"
+    mkdir -p "${RUNTIME_DIR}"
+    if [[ ! -x "${downloader_venv}/bin/hf" ]]; then
+      if ! python3 -m venv "${downloader_venv}"; then
+        warn "無法建立 HF downloader；Ubuntu 可先安裝 python3-venv。"
+        return 1
+      fi
+      if ! "${downloader_venv}/bin/pip" install --quiet --no-cache-dir huggingface_hub; then
+        warn "huggingface_hub 安裝失敗。"
+        return 1
+      fi
+    fi
+    HF_TOKEN="${HF_TOKEN:-}" HF_HUB_DISABLE_TELEMETRY=1 \
+      "${downloader_venv}/bin/hf" download "${repository}" --local-dir "${target}"
+    return
+  fi
+
+  warn "自動下載需要 Python 3、hf CLI 或可用的 Docker。"
   return 1
 }
 

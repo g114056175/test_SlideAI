@@ -117,6 +117,8 @@ curl -sS "$API/api/agent/video-jobs/<run_id>/<job_id>"
 模型可放在任意磁碟，再由建制精靈指定路徑；也可以讓精靈從 Hugging Face
 下載到專案的 `models/`。詳細部署與替換 provider 方法請參閱
 [deploy/README.md](deploy/README.md) 與 [docs/SPEECH_ADAPTERS.md](docs/SPEECH_ADAPTERS.md)。
+預設模型都是公開倉庫，不需要 Hugging Face token；只有改用 gated 或私人模型時
+才需要先設定 `HF_TOKEN`。
 
 ## 資料與安全
 

@@ -48,7 +48,9 @@ models/
 
 Qwen3-TTS 是選用的品質備援，不會阻止主流程啟動。它與 Qwen3-ASR 使用
 不同的 Transformers 版本，因此 Docker 會在 `QWEN3_TTS_INSTALL=1` 時建立
-獨立環境。模型不必搬進專案；
+獨立環境。模型不必搬進專案。
+預設的 Hugging Face 模型均為公開倉庫，不需要 token。私有或 gated 倉庫才需
+在執行建制精靈前設定 `HF_TOKEN`。
 四個 `*_MODEL_HOST_PATH` 可以各自指向不同磁碟。Docker 會將它們分別
 唯讀掛載到容器內固定位置。
 
