@@ -133,6 +133,31 @@ class ArtifactPipelineTests(unittest.TestCase):
         self.assertEqual([page["script"] for page in manifest["pages"]], config["scripts"])
         self.assertTrue(Path(manifest["settings"]["current"]["reference_audio"]["path"]).is_file())
 
+    def test_persistent_page_tts_resolves_builtin_voice_without_uploaded_file(self):
+        generated = self.root / "generated.wav"
+        sf.write(generated, np.zeros(2400, dtype=np.float32), 24000)
+        with (
+            patch.object(video, "get_video_run_store", return_value=self.store),
+            patch.object(video, "synthesize_tts_preview", return_value=(True, str(generated), "ok")) as synth,
+            patch.object(video, "_apply_audio_speed", return_value=str(generated)),
+        ):
+            response = asyncio.run(video.video_run_page_tts_endpoint(
+                run_id=self.run_id,
+                page_index=0,
+                text="這是批次渲染測試。",
+                voice="",
+                speed=1.0,
+                reference_audio=None,
+                reference_text="",
+                selected_voice_key="YunJhe_中文-男",
+                response_mode="json",
+            ))
+        body = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["variant_id"])
+        self.assertGreater(len(synth.call_args.kwargs["reference_audio_bytes"]), 100)
+        self.assertTrue(synth.call_args.kwargs["reference_text"])
+
     def test_five_batch_jobs_recover_in_fifo_order_and_report_positions(self):
         jobs = []
         run_ids = [self.run_id]

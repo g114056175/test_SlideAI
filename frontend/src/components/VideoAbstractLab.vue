@@ -453,6 +453,7 @@ const isPresetVoice = computed(() => selectedVoiceKey.value !== 'custom')
 // 預設音色的 transcript 快取
 const presetManifest = ref({})
 let schedulePersistRunSettings = () => {}
+let persistRunSettingsImmediately = async () => true
 let qwenTtsWarmupTimer = null
 
 const scheduleQwenTtsWarmup = (delay = 250) => {
@@ -696,6 +697,7 @@ const {
   emitter,
   splitMinChars: DEFAULT_SUBTITLE_SPLIT_MIN_CHARS,
   splitMaxChars: DEFAULT_SUBTITLE_SPLIT_MAX_CHARS,
+  persistRunSettingsNow: (options) => persistRunSettingsImmediately(options),
   onMergedPreviewReady: (url, exportVariantId = '') => {
     mergedPreviewVideoUrl.value = String(url || '')
     mergedPreviewThumbnailUrl.value = selectedSlide.value?.previewUrl || selectedSlide.value?.thumbnailUrl || slides.value[0]?.thumbnailUrl || ''
@@ -727,6 +729,7 @@ const {
   clearProjectSettingsSaveTimer,
 } = projectSettings
 schedulePersistRunSettings = projectSettings.schedulePersistRunSettings
+persistRunSettingsImmediately = projectSettings.persistRunSettingsNow
 
 const HIGHLIGHT_LEAD_SEC = SHARED_DEFAULTS.HIGHLIGHT_LEAD_SEC
 const LAST_TOKEN_HOLD_SEC = SHARED_DEFAULTS.LAST_TOKEN_HOLD_SEC

@@ -22,6 +22,7 @@ export function useRenderQueue({
   emitter,
   splitMinChars,
   splitMaxChars,
+  persistRunSettingsNow,
   onMergedPreviewReady,
 }) {
   const renderStopRequested = ref(false)
@@ -81,6 +82,7 @@ export function useRenderQueue({
     formData.append('voice', globalSettings.value.tts.voice)
     formData.append('speed', String(globalSettings.value.tts.speed))
     formData.append('reference_text', referenceText.value.trim())
+    formData.append('selected_voice_key', String(selectedVoiceKey?.value || ''))
     if (cloneAudioFile.value) formData.append('reference_audio', cloneAudioFile.value)
     if (currentRunId.value) formData.append('response_mode', 'json')
 
@@ -369,6 +371,10 @@ export function useRenderQueue({
 
   const renderAllPagesWithBackendJob = async (pagesToRender) => {
     const outputMode = subtitleOutputMode?.value || 'burn'
+    if (typeof persistRunSettingsNow === 'function') {
+      const saved = await persistRunSettingsNow({ includeReferenceAudio: Boolean(cloneAudioFile.value) })
+      if (saved === false) throw new Error('語音設定尚未成功保存，無法開始批次渲染。')
+    }
     const res = await fetch(getApiEndpoint(`/api/video-runs/${encodeURIComponent(currentRunId.value)}/jobs/render`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

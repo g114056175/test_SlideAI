@@ -68,7 +68,7 @@ export function useProjectSettings({
   }
 
   const persistRunSettingsNow = async ({ includeReferenceAudio = false } = {}) => {
-    if (!currentRunId.value || stage.value !== 'workspace' || suppressProjectSettingsSave.value) return
+    if (!currentRunId.value || stage.value !== 'workspace' || suppressProjectSettingsSave.value) return false
     const formData = new FormData()
     formData.append('settings_json', JSON.stringify(collectCurrentProjectSettings()))
     if (includeReferenceAudio && selectedVoiceKey.value === 'custom' && cloneAudioFile.value) {
@@ -83,9 +83,11 @@ export function useProjectSettings({
       if (!res.ok) throw new Error(data?.detail || `設定保存失敗 (${res.status})`)
       runManifest.value = data
       pendingReferenceAudioUpload.value = false
+      return true
     } catch (err) {
       console.warn('[VideoRun] settings save failed:', err)
       renderMessage.value = err.message || '設定保存失敗'
+      return false
     }
   }
 

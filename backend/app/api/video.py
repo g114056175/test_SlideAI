@@ -59,6 +59,26 @@ router = APIRouter()
 _ALIGNMENT_CACHE: dict[str, dict] = {}
 _ALIGNMENT_CACHE_TTL_SEC = 900 # 15 minutes
 MAX_CACHE_ENTRIES = 3
+_PRESET_VOICE_DIR = Path(__file__).resolve().parents[1] / "static" / "ref_voices"
+
+
+def _load_preset_reference_voice(voice_key: str) -> tuple[bytes, str, str] | None:
+    """Resolve a built-in voice without trusting a client-supplied path."""
+    key = str(voice_key or "").strip()
+    if not key or key == "custom":
+        return None
+    try:
+        manifest = json.loads((_PRESET_VOICE_DIR / "manifest.json").read_text(encoding="utf-8"))
+        entry = manifest.get(key) or {}
+        filename = Path(str(entry.get("file") or "")).name
+        if not filename:
+            return None
+        audio_path = (_PRESET_VOICE_DIR / filename).resolve()
+        if _PRESET_VOICE_DIR.resolve() not in audio_path.parents or not audio_path.is_file():
+            return None
+        return audio_path.read_bytes(), filename, str(entry.get("transcript") or "")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def _purge_alignment_cache() -> None:
@@ -613,6 +633,7 @@ async def video_run_page_tts_endpoint(
     speed: float = Form(1.0),
     reference_audio: Optional[UploadFile] = File(None),
     reference_text: str = Form(""),
+    selected_voice_key: str = Form(""),
     response_mode: str = Form("audio"),
 ):
     """Generate one page TTS, persist it immediately, and return the audio."""
@@ -621,16 +642,30 @@ async def video_run_page_tts_endpoint(
         raise HTTPException(status_code=400, detail="page_index must be >= 0")
     ref_data = await reference_audio.read() if reference_audio is not None else None
     reference_filename = reference_audio.filename if reference_audio is not None else "reference.wav"
+    current_settings = {}
     if not ref_data:
         try:
             manifest = get_video_run_store().load_manifest(run_id)
-            saved_ref = (((manifest.get("settings") or {}).get("current") or {}).get("reference_audio") or {})
+            current_settings = ((manifest.get("settings") or {}).get("current") or {})
+            saved_ref = current_settings.get("reference_audio") or {}
             saved_ref_path = Path(str(saved_ref.get("path") or ""))
             if saved_ref_path.is_file():
                 ref_data = await asyncio.to_thread(saved_ref_path.read_bytes)
                 reference_filename = str(saved_ref.get("filename") or saved_ref_path.name)
         except FileNotFoundError:
             pass
+    if not ref_data:
+        # Batch rendering submits JSON and cannot attach the browser File on
+        # every page.  Resolve built-in voices directly from the trusted
+        # server manifest, using either the request or persisted selection.
+        preset = await asyncio.to_thread(
+            _load_preset_reference_voice,
+            selected_voice_key or current_settings.get("selected_voice_key") or "",
+        )
+        if preset:
+            ref_data, reference_filename, preset_transcript = preset
+            if not (reference_text or "").strip():
+                reference_text = str(current_settings.get("reference_text") or preset_transcript)
     if not ref_data:
         raise HTTPException(status_code=400, detail="請提供參考音檔以生成語音。")
     file_suffix = os.path.splitext(reference_filename or "")[-1] or ".wav"
@@ -1889,6 +1924,7 @@ async def _run_persistent_batch_job(run_id: str, job_id: str) -> None:
                         speed=float(payload.get("tts_speed") or 1.0),
                         reference_audio=None,
                         reference_text=str(payload.get("reference_text") or ""),
+                        selected_voice_key=str(payload.get("selected_voice_key") or ""),
                         response_mode="json",
                     )
                     data = json.loads(bytes(response.body).decode("utf-8"))
