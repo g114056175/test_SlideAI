@@ -15,7 +15,7 @@ On the destination:
 
 ```bash
 cd /srv/slideai-handoff/SlideAI
-./slideai.sh setup
+./slideai.sh build
 ./slideai.sh start
 ```
 

@@ -71,7 +71,8 @@ docker/
 
 模型不會寫入映像，而是從主機唯讀掛載，因此更新程式不需重新複製模型。
 服務日誌由 Docker 管理，每個容器最多保留 3 份、每份 10MB；前端 access
-log 與後端逐請求 access log 已關閉。使用 `./slideai.sh logs` 查看即可，
+log 與後端逐請求 access log 已關閉。服務摘要可由 `./slideai.sh` 選單的
+「4 狀態」查看；需要容器細節時可執行 `docker compose logs --tail=200`。
 專案目錄不再產生 PID、startup、shutdown 等零碎檔案。
 
 ## 替換模型或商用 API

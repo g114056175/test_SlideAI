@@ -49,8 +49,8 @@ LLM 呼叫則由 `LLM_MAX_CONCURRENCY` 設定全站共用併發上限，預設�
 目前 Docker 映像鎖定 Linux x86-64、Python 3.12、CUDA 13 系列 PyTorch。
 Windows 並非目前正式支援的直接部署平台。
 
-`New_slideai.sh` 是目前測試中的引導式建制入口。它會先檢查 Linux/x86-64、
-Docker、NVIDIA GPU/runtime，再分別詢問是否建置前後端、下載或指定 TTS、ASR、
+`slideai.sh` 是專案唯一的管理與建制入口。它會先檢查 Linux/x86-64、Docker、
+NVIDIA GPU/runtime，再分別詢問是否建置前後端、下載或指定 TTS、ASR、
 強制對齊模型，以及設定 LLM。Ubuntu/Debian 可由腳本協助安裝 Docker；其他
 Linux 發行版只要事先備妥 Docker Engine、Compose v2、NVIDIA driver 與
 Container Toolkit，仍可使用相同 Docker 映像。ARM、AMD GPU 與純 CPU
@@ -61,31 +61,19 @@ Container Toolkit，仍可使用相同 Docker 映像。ARM、AMD GPU 與純 CPU
 安裝 Container Toolkit 並設定 Docker；它不會自行更新或更換主機 kernel／driver。
 
 ```bash
-chmod +x New_slideai.sh
-./New_slideai.sh
+chmod +x slideai.sh
+./slideai.sh
 ```
 
 LLM 可選 Gemini、OpenAI、Claude、OpenRouter、xAI、Groq，或自訂
 OpenAI-compatible `chat/completions` URL。本地 llama.cpp 等無驗證 endpoint
 可以留空 API key；實際憑證寫入權限為 `0600` 的 `backend/.env`。
 
-## 一鍵啟動
+## 下載與首次建制
 
 ```bash
 git clone https://github.com/g114056175/test_SlideAI.git
 cd test_SlideAI
-```
-
-準備 LLM 設定：
-
-```bash
-cp backend/.env.example backend/.env
-# 編輯 backend/.env，填入 api_key、模型名稱與安全的 SECRET_KEY
-```
-
-然後執行：
-
-```bash
 chmod +x slideai.sh
 ./slideai.sh
 ```
@@ -94,23 +82,24 @@ chmod +x slideai.sh
 
 ```text
 1) 啟動
-2) 建置 Docker
-3) 停止
-4) 重新啟動
-5) 狀態
-6) 環境檢查
-7) 部署設定
-8) 查看日誌
-9) 基本前後端（跳過模型與 Docker）
+2) 關閉
+3) 重新啟動
+4) 狀態（服務、模型與環境）
+5) 設定
+6) 建制（首次安裝精靈）
 0) 離開
 ```
 
-第一次選擇「啟動」時會依序檢查：
+第一次使用建議先選擇 `6 建制`。精靈會逐步檢查：
 
-- Ubuntu、Docker Engine 與 Docker Compose；
-- NVIDIA 驅動與 NVIDIA Container Toolkit；
-- VoxCPM2、Qwen3-ASR、Qwen3 ForcedAligner 模型；
-- `backend/.env` 與模型下載設定。
+- 前後端 Docker 環境；
+- NVIDIA driver 與 NVIDIA Container Toolkit；
+- VoxCPM2、Qwen3-ASR、Qwen3 ForcedAligner；
+- Gemini、OpenAI、Claude、OpenRouter、xAI、Groq 或自訂 LLM API。
+
+每一個安裝或下載步驟都會先詢問。已有模型時可以選擇指定現有路徑，
+不必重新下載；暫時只想確認前後端時，也可以跳過模型與 LLM。建制完成後
+選擇 `1 啟動`，終端會印出本機與區網 WebUI 網址。
 
 `deploy/models.env` 可直接填寫既有模型的絕對路徑；模型不需要搬入專案。
 只有設定的路徑不存在時，腳本才會詢問是否依下載來源取得模型。使用者可
@@ -137,32 +126,31 @@ chmod +x slideai.sh
 瀏覽器的 API 請求使用同源 `/api`，由前端服務代理至 FastAPI；使用者端
 不需要能直接連線後端 port，也不會把特定主機 IP 寫死在前端 bundle。
 
-自動化環境仍可明確指定命令：
+一般使用者直接使用數字選單即可。自動化環境亦可使用下列命令：
 
 ```bash
 ./slideai.sh start
-./slideai.sh build
 ./slideai.sh stop
 ./slideai.sh restart
 ./slideai.sh status
-./slideai.sh logs
-./slideai.sh check
+./slideai.sh settings
+./slideai.sh build
 ```
 
-若只想在乾淨環境確認 WebUI 與 FastAPI，不下載模型也不建置 Docker：
+`5 設定` 可在建制後修改部署模式、port、模型路徑、LLM 或語音 runtime
+參數。`4 狀態` 只做檢查，不會下載模型或修改環境。
 
-```bash
-./slideai.sh app-only
-```
+## WebUI 使用流程
 
-此模式會建立精簡 `backend/.venv`、執行 `npm ci` 並啟動前後端，但不提供
-LLM 講稿、TTS、ASR 或強制對齊推論。PDF 上傳、逐頁預覽、專案保存與前後
-端跳轉仍可測試；模型相關步驟會明確略過。可用 `BACKEND_PORT`、
-`FRONTEND_PORT` 指定搜尋起點：
+1. 開啟終端顯示的 `/video-abstract-lab` 網址並上傳 PDF。
+2. 選擇不使用 LLM，或讓 LLM 產生逐頁講稿；進入工作區後仍可人工修改。
+3. 在「語音設定」選擇參考聲音、語速等參數。
+4. 在「字幕設定」選擇無字幕、輸出 SRT 或燒錄字幕。
+5. 可先渲染單頁試聽；確認後再執行「渲染全部」。
+6. 選擇 `ALL` 預覽合併結果，並下載 MP4、SRT 或完整輸出。
 
-```bash
-BACKEND_PORT=8102 FRONTEND_PORT=5274 ./slideai.sh app-only
-```
+多人同時渲染全部時，工作會依 FIFO 排隊；畫面會顯示前方任務數、目前
+TTS／對齊／影片階段與逐頁進度。瀏覽器重新整理後也會接回尚未完成的任務。
 
 ## 模型
 

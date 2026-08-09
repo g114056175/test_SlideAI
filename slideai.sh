@@ -1,340 +1,167 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# SlideAI unified guided launcher and setup wizard.
+# Linux x86_64 is the supported full-GPU deployment target; Ubuntu/Debian can
+# install Docker automatically.  This one file owns setup and service control.
+
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_FILE="${PROJECT_ROOT}/docker-compose.yml"
-MODEL_CONFIG="${PROJECT_ROOT}/deploy/models.env"
-MODEL_CONFIG_EXAMPLE="${PROJECT_ROOT}/deploy/models.env.example"
+MODEL_ENV="${PROJECT_ROOT}/deploy/models.env"
+MODEL_ENV_EXAMPLE="${PROJECT_ROOT}/deploy/models.env.example"
 BACKEND_ENV="${PROJECT_ROOT}/backend/.env"
 BACKEND_ENV_EXAMPLE="${PROJECT_ROOT}/backend/.env.example"
+PORT_STATE="${PROJECT_ROOT}/runtime/ports.env"
 RUNTIME_DIR="${PROJECT_ROOT}/runtime"
-PORT_STATE="${RUNTIME_DIR}/ports.env"
-NONINTERACTIVE="${SLIDEAI_NONINTERACTIVE:-0}"
 DOCKER=(docker)
 
 cd "${PROJECT_ROOT}"
 
 say() { printf '%s\n' "$*"; }
+info() { printf '[INFO] %s\n' "$*"; }
+ok() { printf '[OK] %s\n' "$*"; }
+skip() { printf '[略過] %s\n' "$*"; }
 warn() { printf '警告：%s\n' "$*" >&2; }
-fail() { printf '錯誤：%s\n' "$*" >&2; exit 1; }
+die() { printf '錯誤：%s\n' "$*" >&2; exit 1; }
 
+line() { printf '%s\n' '────────────────────────────────────────────────────────'; }
+
+is_interactive() { [[ -t 0 && -t 1 ]]; }
+
+pause_screen() {
+  is_interactive || return 0
+  read -r -p "按 Enter 返回主選單……" _
+}
+
+# Usage: confirm "Question" yes|no
 confirm() {
-  local prompt="$1"
-  [[ "${NONINTERACTIVE}" == "1" ]] && return 1
-  read -r -p "${prompt} [y/N] " answer
-  [[ "${answer,,}" == "y" || "${answer,,}" == "yes" ]]
-}
-
-usage() {
-  cat <<'EOF'
-SlideAI Ubuntu 管理工具
-
-  ./slideai.sh start    檢查環境、引導模型準備並啟動
-  ./slideai.sh build    明確重建 Docker 映像
-  ./slideai.sh stop     停止 SlideAI
-  ./slideai.sh restart  重新啟動
-  ./slideai.sh status   顯示容器與 GPU 狀態
-  ./slideai.sh logs     追蹤服務紀錄
-  ./slideai.sh setup    只進行環境與模型設定
-  ./slideai.sh check    唯讀檢查，不安裝或下載
-  ./slideai.sh app-only 只建置並啟動基本前後端，不需要模型或 Docker
-
-不帶參數時會顯示數字選單。
-EOF
-}
-
-choose_command() {
-  if [[ ! -t 0 ]]; then
-    usage
-    fail "非互動環境請明確指定指令，例如：./slideai.sh start"
+  local prompt="$1" default="${2:-no}" answer suffix
+  is_interactive || return 1
+  [[ "${default}" == "yes" ]] && suffix='[Y/n]' || suffix='[y/N]'
+  read -r -p "${prompt} ${suffix} " answer
+  answer="${answer,,}"
+  if [[ -z "${answer}" ]]; then
+    [[ "${default}" == "yes" ]]
+  else
+    [[ "${answer}" == "y" || "${answer}" == "yes" ]]
   fi
-  cat >&2 <<'EOF'
-SlideAI 管理選單
-
-  1) 啟動
-  2) 建置 Docker
-  3) 停止
-  4) 重新啟動
-  5) 狀態
-  6) 環境檢查
-  7) 部署設定
-  8) 查看日誌
-  9) 基本前後端（跳過模型與 Docker）
-  0) 離開
-EOF
-  local choice
-  read -r -p "請輸入選項 [0-9]：" choice
-  case "${choice}" in
-    1) printf 'start' ;;
-    2) printf 'build' ;;
-    3) printf 'stop' ;;
-    4) printf 'restart' ;;
-    5) printf 'status' ;;
-    6) printf 'check' ;;
-    7) printf 'setup' ;;
-    8) printf 'logs' ;;
-    9) printf 'app-only' ;;
-    0) printf 'exit' ;;
-    *) fail "無效選項：${choice}" ;;
-  esac
 }
 
-load_model_config() {
-  local readonly="${1:-0}"
-  if [[ ! -f "${MODEL_CONFIG}" ]]; then
-    if [[ "${readonly}" == "1" ]]; then
-      warn "deploy/models.env 尚未建立；以下使用範例中的預設路徑檢查。"
-      set -a
-      # shellcheck disable=SC1090
-      source "${MODEL_CONFIG_EXAMPLE}"
-      set +a
-    else
-      cp "${MODEL_CONFIG_EXAMPLE}" "${MODEL_CONFIG}"
-      say "已建立 deploy/models.env；可填入你提供的模型網址。"
-    fi
+ensure_config_files() {
+  if [[ ! -f "${MODEL_ENV}" ]]; then
+    cp "${MODEL_ENV_EXAMPLE}" "${MODEL_ENV}"
+    info "已由範例建立 deploy/models.env。"
   fi
-  set -a
-  # shellcheck disable=SC1090
-  source "$([[ -f "${MODEL_CONFIG}" ]] && printf '%s' "${MODEL_CONFIG}" || printf '%s' "${MODEL_CONFIG_EXAMPLE}")"
-  set +a
-  local variable value
-  for variable in \
-    VOXTTS_MODEL_HOST_PATH \
-    QWEN3_ASR_MODEL_HOST_PATH \
-    QWEN3_ALIGNER_MODEL_HOST_PATH \
-    QWEN3_TTS_MODEL_HOST_PATH; do
-    value="${!variable:-}"
-    [[ -n "${value}" ]] || fail "${variable} 未設定。"
-    if [[ "${value}" != /* ]]; then
-      value="${PROJECT_ROOT}/${value#./}"
-    fi
-    printf -v "${variable}" '%s' "${value}"
-    export "${variable}"
-  done
-  SLIDEAI_DEPLOY_MODE="${SLIDEAI_DEPLOY_MODE:-docker}"
-  export SLIDEAI_DEPLOY_MODE
-}
-
-compose_cmd() {
-  local options=(compose)
-  [[ -f "${MODEL_CONFIG}" ]] && options+=(--env-file "${MODEL_CONFIG}")
-  options+=(-f "${COMPOSE_FILE}")
-  "${DOCKER[@]}" "${options[@]}" "$@"
-}
-
-ensure_app_config() {
   if [[ ! -f "${BACKEND_ENV}" ]]; then
     cp "${BACKEND_ENV_EXAMPLE}" "${BACKEND_ENV}"
-    say "已建立 backend/.env；使用 LLM 前請自行填入 API key。"
+    info "已由範例建立 backend/.env。"
   fi
+  chmod 600 "${BACKEND_ENV}"
 }
 
-is_ubuntu() {
-  [[ -r /etc/os-release ]] || return 1
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  [[ "${ID:-}" == "ubuntu" || "${ID_LIKE:-}" == *ubuntu* ]]
-}
-
-install_docker_ubuntu() {
-  confirm "未找到 Docker，是否以 Ubuntu 套件安裝？" || return 1
-  sudo apt-get update
-  sudo apt-get install -y docker.io
-  if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
-    sudo apt-get install -y docker-compose-v2
-  else
-    sudo apt-get install -y docker-compose-plugin
-  fi
-  sudo systemctl enable --now docker
-}
-
-check_docker() {
-  if ! command -v docker >/dev/null 2>&1; then
-    install_docker_ubuntu || fail "請先安裝 Docker Engine 與 Compose v2。"
-  fi
-  docker compose version >/dev/null 2>&1 || fail "找不到 Docker Compose v2。"
-  if ! docker info >/dev/null 2>&1; then
-    warn "目前帳號無法連線 Docker daemon。"
-    if confirm "是否暫時使用 sudo 執行 Docker？"; then
-      sudo docker info >/dev/null
-      sudo docker compose version >/dev/null
-      DOCKER=(sudo docker)
-      say "本次使用 sudo；長期建議將帳號加入 docker 群組後重新登入。"
+ensure_secret_key() {
+  ensure_config_files
+  local secret
+  secret="$(env_value "${BACKEND_ENV}" SECRET_KEY 2>/dev/null || true)"
+  if [[ -z "${secret}" || "${secret}" == "replace-with-a-long-random-value" ]]; then
+    if command -v openssl >/dev/null 2>&1; then
+      secret="$(openssl rand -hex 32)"
     else
-      say "可執行：sudo usermod -aG docker \"${USER}\""
-      say "之後登出再登入；或請系統管理員授權 Docker。"
-      return 1
+      secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
     fi
+    set_env_value "${BACKEND_ENV}" SECRET_KEY "${secret}"
+    info "已產生本機 SECRET_KEY（內容不顯示）。"
   fi
 }
 
-check_gpu_runtime() {
-  command -v nvidia-smi >/dev/null 2>&1 || {
-    warn "找不到 nvidia-smi；完整 TTS/ASR 工作流需要 NVIDIA GPU 驅動。"
-    return 1
-  }
-  nvidia-smi >/dev/null 2>&1 || {
-    warn "NVIDIA 驅動目前無法正常存取 GPU。"
-    return 1
-  }
-  if ! "${DOCKER[@]}" info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
-    warn "Docker 尚未註冊 NVIDIA runtime。"
-    say "請依 NVIDIA Container Toolkit 官方安裝指南設定後重新執行："
-    say "https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
-    return 1
+env_value() {
+  local file="$1" key="$2" value
+  [[ -f "${file}" ]] || return 1
+  value="$(awk -v key="${key}" '
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      sub("^[^=]*=[[:space:]]*", ""); found=$0
+    }
+    END { if (found != "") print found }
+  ' "${file}")"
+  [[ -n "${value}" ]] || return 1
+  if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\$/\$}"
+    value="${value//\\\\/\\}"
+  elif [[ "${value}" == \'*\' && "${value}" == *\' ]]; then
+    value="${value:1:${#value}-2}"
+  fi
+  printf '%s' "${value}"
+}
+
+quote_env_value() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '"%s"' "${value}"
+}
+
+set_env_value() {
+  local file="$1" key="$2" value="$3" encoded temp
+  [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "無效環境變數名稱：${key}"
+  [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || die "環境變數不可包含換行。"
+  mkdir -p "$(dirname "${file}")"
+  [[ -f "${file}" ]] || : > "${file}"
+  encoded="$(quote_env_value "${value}")"
+  temp="$(mktemp "${file}.tmp.XXXXXX")"
+  awk -v key="${key}" -v replacement="${key}=${encoded}" '
+    BEGIN { written=0 }
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      if (!written) print replacement
+      written=1
+      next
+    }
+    { print }
+    END { if (!written) print replacement }
+  ' "${file}" > "${temp}"
+  mv "${temp}" "${file}"
+  if [[ "${file}" == "${BACKEND_ENV}" ]]; then
+    chmod 600 "${file}"
   fi
 }
 
-model_ready() {
-  local target="$1"
-  [[ -f "${target}/config.json" ]] || return 1
-  find "${target}" -maxdepth 1 -type f \
-    \( -name '*.safetensors' -o -name '*.pth' -o -name '*.bin' \) \
-    -print -quit | grep -q .
-}
-
-download_http_archive() {
-  local source="$1" target="$2"
-  local temp_dir archive extract_root payload
-  temp_dir="$(mktemp -d)"
-  archive="${temp_dir}/bundle"
-  extract_root="${temp_dir}/extract"
-  mkdir -p "${extract_root}"
-  trap '[[ -n "${temp_dir:-}" && "${temp_dir}" == /tmp/* ]] && rm -rf "${temp_dir}"' RETURN
-  curl -fL --retry 3 --progress-bar "${source}" -o "${archive}"
-  case "${source%%\?*}" in
-    *.zip) command -v unzip >/dev/null || fail "下載 ZIP 需要 unzip"; unzip -q "${archive}" -d "${extract_root}" ;;
-    *.tar.gz|*.tgz) tar -xzf "${archive}" -C "${extract_root}" ;;
-    *.tar.zst|*.tzst) tar --zstd -xf "${archive}" -C "${extract_root}" ;;
-    *.tar) tar -xf "${archive}" -C "${extract_root}" ;;
-    *) fail "無法辨識模型壓縮格式：${source}" ;;
-  esac
-  payload="${extract_root}"
-  if [[ "$(find "${extract_root}" -mindepth 1 -maxdepth 1 | wc -l)" == "1" ]]; then
-    local only_entry
-    only_entry="$(find "${extract_root}" -mindepth 1 -maxdepth 1 -print -quit)"
-    [[ -d "${only_entry}" ]] && payload="${only_entry}"
-  fi
-  mkdir -p "${target}"
-  cp -a "${payload}/." "${target}/"
-}
-
-download_model() {
-  local label="$1" source="$2" target="$3"
-  [[ -n "${source}" ]] || {
-    warn "${label} 尚未設定下載來源；請編輯 deploy/models.env。"
-    return 1
-  }
-  say "準備 ${label} -> ${target}"
-  if [[ "${source}" == hf:* ]]; then
-    local repo="${source#hf:}"
-    mkdir -p "${target}"
-    if command -v hf >/dev/null 2>&1; then
-      hf download "${repo}" --local-dir "${target}"
-    elif command -v docker >/dev/null 2>&1 && "${DOCKER[@]}" info >/dev/null 2>&1; then
-      say "本機沒有 hf CLI，改用一次性 Docker 下載器。"
-      "${DOCKER[@]}" run --rm \
-        --user "$(id -u):$(id -g)" \
-        -e HF_REPO="${repo}" \
-        -e HF_TOKEN \
-        -v "${target}:/download" \
-        python:3.12-slim \
-        sh -c 'python -m pip install --quiet --no-cache-dir huggingface_hub && hf download "$HF_REPO" --local-dir /download'
-    else
-      warn "Hugging Face 來源需要 hf CLI 或可用的 Docker daemon。"
-      say "可安裝：python3 -m pip install --user huggingface_hub"
-      return 1
-    fi
-  elif [[ "${source}" =~ ^https?:// ]]; then
-    download_http_archive "${source}" "${target}"
-  elif [[ -d "${source}" ]]; then
-    mkdir -p "${target}"
-    cp -a "${source}/." "${target}/"
+absolute_path() {
+  local value="$1"
+  if [[ "${value}" == /* ]]; then
+    printf '%s' "${value}"
   else
-    warn "${label} 來源不存在或格式不支援：${source}"
-    return 1
+    printf '%s/%s' "${PROJECT_ROOT}" "${value#./}"
   fi
-  model_ready "${target}" || {
-    warn "${label} 下載完成，但找不到 config.json 或模型權重。"
-    return 1
-  }
 }
 
-prepare_one_model() {
-  local label="$1" path_var="$2" source_var="$3" required="$4"
-  local target="${!path_var}"
-  local source="${!source_var:-}"
-  if model_ready "${target}"; then
-    say "[OK] ${label}"
+load_model_settings() {
+  ensure_config_files
+  set -a
+  # shellcheck disable=SC1090
+  source "${MODEL_ENV}"
+  set +a
+}
+
+compose() {
+  local args=(compose --env-file "${MODEL_ENV}" -f "${COMPOSE_FILE}")
+  "${DOCKER[@]}" "${args[@]}" "$@"
+}
+
+docker_access() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker compose version >/dev/null 2>&1 || return 1
+  if docker info >/dev/null 2>&1; then
+    DOCKER=(docker)
     return 0
   fi
-  if [[ "${required}" == "0" && -z "${source}" ]]; then
-    say "[略過] ${label} 未設定，主工作流不受影響。"
+  if sudo -n docker info >/dev/null 2>&1; then
+    DOCKER=(sudo docker)
     return 0
   fi
-  warn "缺少 ${label}：${target}"
-  if confirm "是否依 deploy/models.env 的來源下載 ${label}？"; then
-    download_model "${label}" "${source}" "${target}" && return 0
-  fi
-  [[ "${required}" == "0" ]] && return 0
   return 1
-}
-
-check_models_only() {
-  local failed=0 label path_var target
-  while IFS='|' read -r label path_var; do
-    target="${!path_var}"
-    if model_ready "${target}"; then
-      say "[OK] ${label}：${target}"
-    else
-      warn "缺少 ${label}：${target}"
-      failed=1
-    fi
-  done <<'EOF'
-VoxCPM2 TTS|VOXTTS_MODEL_HOST_PATH
-Qwen3 ASR|QWEN3_ASR_MODEL_HOST_PATH
-Qwen3 ForcedAligner|QWEN3_ALIGNER_MODEL_HOST_PATH
-EOF
-  return "${failed}"
-}
-
-prepare_models() {
-  local failed=0
-  prepare_one_model "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE 1 || failed=1
-  prepare_one_model "Qwen3 ASR" QWEN3_ASR_MODEL_HOST_PATH QWEN3_ASR_SOURCE 1 || failed=1
-  prepare_one_model "Qwen3 ForcedAligner" QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_ALIGNER_SOURCE 1 || failed=1
-  prepare_one_model "Qwen3 TTS（選用）" QWEN3_TTS_MODEL_HOST_PATH QWEN3_TTS_SOURCE 0 || true
-  return "${failed}"
-}
-
-preflight() {
-  is_ubuntu || warn "目前不是已確認的 Ubuntu 環境；建議使用 Ubuntu 24.04。"
-  check_docker
-  check_gpu_runtime
-  load_model_config
-  ensure_app_config
-}
-
-check_native_runtimes() {
-  local nano_python="${VOXTTS_RUNTIME_PYTHON_HOST_PATH:-}"
-  local qwen_python="${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH:-}"
-  [[ -x "${nano_python}" ]] || {
-    warn "Nano runtime Python 不存在：${nano_python:-<未設定>}"
-    return 1
-  }
-  [[ -x "${qwen_python}" ]] || {
-    warn "Qwen speech runtime Python 不存在：${qwen_python:-<未設定>}"
-    return 1
-  }
-  "${nano_python}" -c "import nanovllm_voxcpm" >/dev/null 2>&1 || {
-    warn "Nano runtime 無法匯入 nanovllm_voxcpm。"
-    return 1
-  }
-  "${qwen_python}" -c "import qwen_asr" >/dev/null 2>&1 || {
-    warn "Qwen runtime 無法匯入 qwen_asr。"
-    return 1
-  }
-  say "[OK] 既有 Nano／Qwen speech runtimes"
 }
 
 read_port_state() {
@@ -347,7 +174,7 @@ read_port_state() {
     case "${key}" in
       FRONTEND_PORT) [[ "${value}" =~ ^[0-9]{4,5}$ ]] && ACTIVE_FRONTEND_PORT="${value}" ;;
       BACKEND_PORT) [[ "${value}" =~ ^[0-9]{4,5}$ ]] && ACTIVE_BACKEND_PORT="${value}" ;;
-      DEPLOY_MODE) [[ "${value}" =~ ^(app-only|native|docker)$ ]] && ACTIVE_DEPLOY_MODE="${value}" ;;
+      DEPLOY_MODE) [[ "${value}" =~ ^(basic|native|docker)$ ]] && ACTIVE_DEPLOY_MODE="${value}" ;;
     esac
   done < "${PORT_STATE}"
   [[ -n "${ACTIVE_FRONTEND_PORT}" && -n "${ACTIVE_BACKEND_PORT}" ]]
@@ -368,15 +195,13 @@ clear_port_state() {
 }
 
 port_is_available() {
-  local port="$1"
-  python3 - "${port}" <<'PY'
+  python3 - "$1" <<'PY'
 import socket
 import sys
 
-port = int(sys.argv[1])
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     try:
-        sock.bind(("0.0.0.0", port))
+        sock.bind(("0.0.0.0", int(sys.argv[1])))
     except OSError:
         raise SystemExit(1)
 PY
@@ -384,7 +209,7 @@ PY
 
 find_available_port() {
   local candidate="$1"
-  while (( candidate <= 9999 )); do
+  while (( candidate <= 65535 )); do
     if port_is_available "${candidate}"; then
       printf '%s' "${candidate}"
       return 0
@@ -395,12 +220,11 @@ find_available_port() {
 }
 
 select_runtime_ports() {
-  local mode="$1"
-  local requested_frontend="${FRONTEND_PORT:-5174}"
-  local requested_backend="${BACKEND_PORT:-8002}"
-  local reused=0
-  [[ "${requested_frontend}" =~ ^[0-9]{4}$ ]] || fail "FRONTEND_PORT 必須是四位數 port。"
-  [[ "${requested_backend}" =~ ^[0-9]{4}$ ]] || fail "BACKEND_PORT 必須是四位數 port。"
+  local mode="$1" requested_frontend requested_backend reused=0
+  requested_frontend="${FRONTEND_PORT:-5174}"
+  requested_backend="${BACKEND_PORT:-8002}"
+  [[ "${requested_frontend}" =~ ^[0-9]{4,5}$ ]] || die "FRONTEND_PORT 格式錯誤。"
+  [[ "${requested_backend}" =~ ^[0-9]{4,5}$ ]] || die "BACKEND_PORT 格式錯誤。"
 
   if read_port_state \
     && [[ "${ACTIVE_DEPLOY_MODE}" == "${mode}" ]] \
@@ -410,90 +234,88 @@ select_runtime_ports() {
     BACKEND_PORT="${ACTIVE_BACKEND_PORT}"
     reused=1
   else
-    FRONTEND_PORT="$(find_available_port "${requested_frontend}")" \
-      || fail "找不到 ${requested_frontend} 之後可用的前端 port。"
-    BACKEND_PORT="$(find_available_port "${requested_backend}")" \
-      || fail "找不到 ${requested_backend} 之後可用的後端 port。"
+    FRONTEND_PORT="$(find_available_port "${requested_frontend}")" || die "找不到可用的前端 port。"
+    BACKEND_PORT="$(find_available_port "${requested_backend}")" || die "找不到可用的後端 port。"
     if [[ "${FRONTEND_PORT}" == "${BACKEND_PORT}" ]]; then
-      BACKEND_PORT="$(find_available_port "$((BACKEND_PORT + 1))")" \
-        || fail "找不到可用的後端 port。"
+      BACKEND_PORT="$(find_available_port "$((BACKEND_PORT + 1))")" || die "找不到可用的後端 port。"
     fi
   fi
   export FRONTEND_PORT BACKEND_PORT
-
-  if [[ "${reused}" == "0" ]] \
+  if (( reused == 0 )) \
     && [[ "${FRONTEND_PORT}" != "${requested_frontend}" || "${BACKEND_PORT}" != "${requested_backend}" ]]; then
-    say "預設 port 已被占用，自動改用前端 ${FRONTEND_PORT}、後端 ${BACKEND_PORT}。"
+    info "預設 port 已占用，自動改用 frontend ${FRONTEND_PORT} / backend ${BACKEND_PORT}。"
   fi
 }
 
 announce_runtime_ports() {
-  local label="$1"
-  local lan_ip
+  local label="$1" lan_ip
   lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  say "${label}"
-  say "前端：http://127.0.0.1:${FRONTEND_PORT}/video-abstract-lab"
-  [[ -n "${lan_ip}" ]] && say "區網：http://${lan_ip}:${FRONTEND_PORT}/video-abstract-lab"
-  say "後端：http://127.0.0.1:${BACKEND_PORT}/docs"
+  ok "${label}"
+  say "  WebUI：http://127.0.0.1:${FRONTEND_PORT}/video-abstract-lab"
+  [[ -n "${lan_ip}" ]] && say "  區網：http://${lan_ip}:${FRONTEND_PORT}/video-abstract-lab"
+  say "  API：http://127.0.0.1:${BACKEND_PORT}/docs"
 }
 
-stop_project_native() {
-  local backend_port="${BACKEND_PORT:-8002}"
-  local frontend_port="${FRONTEND_PORT:-5174}"
+stop_native_processes() {
+  local backend_port="${BACKEND_PORT:-8002}" frontend_port="${FRONTEND_PORT:-5174}"
   local backend_pattern="${PROJECT_ROOT}/backend/\\.venv/bin/python -m uvicorn backend\\.app\\.main:app .*--port ${backend_port}"
   local frontend_pattern="${PROJECT_ROOT}/frontend/node_modules/.bin/vite preview .*--port ${frontend_port}"
   pkill -f "${backend_pattern}" 2>/dev/null || true
   pkill -f "${frontend_pattern}" 2>/dev/null || true
-  local i
-  for i in $(seq 1 50); do
-    if ! pgrep -f "${backend_pattern}" >/dev/null 2>&1 \
-      && ! pgrep -f "${frontend_pattern}" >/dev/null 2>&1; then
-      return
-    fi
-    sleep 0.1
-  done
-  warn "本機服務仍在結束中，port 可能需要稍候才會釋放。"
 }
 
-prepare_app_only() {
-  command -v python3 >/dev/null 2>&1 || fail "基本前後端模式需要 Python 3。"
-  command -v npm >/dev/null 2>&1 || fail "基本前後端模式需要 Node.js/npm。"
+required_models_ready() {
+  load_model_settings
+  local failed=0 label key value path
+  while IFS='|' read -r label key; do
+    value="${!key:-}"
+    path="$(absolute_path "${value}")"
+    if model_ready "${path}"; then
+      ok "${label}"
+    else
+      warn "缺少 ${label}：${path}"
+      failed=1
+    fi
+  done <<'EOF'
+VoxCPM2 TTS|VOXTTS_MODEL_HOST_PATH
+Qwen3 ASR|QWEN3_ASR_MODEL_HOST_PATH
+Qwen3 ForcedAligner|QWEN3_ALIGNER_MODEL_HOST_PATH
+EOF
+  (( failed == 0 )) || {
+    warn "請先從主選單執行『6 建制』或在『5 設定』指定既有模型。"
+    return 1
+  }
+}
+
+prepare_basic_runtime() {
+  command -v python3 >/dev/null 2>&1 || die "需要 Python 3。"
+  command -v npm >/dev/null 2>&1 || die "需要 Node.js/npm。"
   if [[ ! -x "${PROJECT_ROOT}/backend/.venv/bin/python" ]]; then
-    say "建立精簡 backend 環境……"
+    info "建立 backend 虛擬環境……"
     python3 -m venv "${PROJECT_ROOT}/backend/.venv"
     "${PROJECT_ROOT}/backend/.venv/bin/pip" install --quiet --disable-pip-version-check \
       -r "${PROJECT_ROOT}/backend/requirements.txt"
   fi
   if [[ ! -d "${PROJECT_ROOT}/frontend/node_modules" ]]; then
-    say "安裝 frontend 依賴……"
+    info "安裝 frontend 依賴……"
     npm --prefix "${PROJECT_ROOT}/frontend" ci --no-audit --no-fund --loglevel=error
   fi
 }
 
-start_app_only() {
-  ensure_app_config
-  prepare_app_only
-  select_runtime_ports app-only
-  local backend_port="${BACKEND_PORT:-8002}"
-  local frontend_port="${FRONTEND_PORT:-5174}"
-  local lan_ip
+start_basic_services() {
+  ensure_secret_key
+  prepare_basic_runtime
+  load_model_settings
+  select_runtime_ports basic
+  local backend_port="${BACKEND_PORT}" frontend_port="${FRONTEND_PORT}" lan_ip attempt
   lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-
-  if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
-    && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-    save_port_state app-only
-    announce_runtime_ports "基本前後端已在運作。"
-    return
-  fi
-
-  stop_project_native
+  stop_native_processes
   (
     set -a
     # shellcheck disable=SC1090
     source "${BACKEND_ENV}"
     set +a
-    export VIDEO_ABSTRACT_LOCAL_ONLY=true
-    export VIDEO_ABSTRACT_MOCK_MODE=true
+    export VIDEO_ABSTRACT_LOCAL_ONLY=true VIDEO_ABSTRACT_MOCK_MODE=true
     export FRONTEND_URL="http://127.0.0.1:${frontend_port},http://localhost:${frontend_port}"
     [[ -n "${lan_ip}" ]] && export FRONTEND_URL="${FRONTEND_URL},http://${lan_ip}:${frontend_port}"
     export SLIDEAI_VIDEO_RUNS_DIR="${PROJECT_ROOT}/data/video_runs"
@@ -503,236 +325,789 @@ start_app_only() {
   )
   (
     cd "${PROJECT_ROOT}/frontend"
-    VITE_API_BASE_URL="/api" npm run build >/dev/null
+    VITE_API_BASE_URL=/api npm run build >/dev/null
     VITE_API_PROXY_TARGET="http://127.0.0.1:${backend_port}" \
       nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" --strictPort \
       >/dev/null 2>&1 < /dev/null &
   )
-
-  local i
-  for i in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
+  for attempt in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${backend_port}/api/health" >/dev/null 2>&1 \
       && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-      save_port_state app-only
-      announce_runtime_ports "基本前後端已啟動。"
-      say "此模式不載入 TTS／ASR／強制對齊模型。"
-      return
+      save_port_state basic
+      announce_runtime_ports "基本前後端已啟動（未載入語音模型）"
+      return 0
     fi
     sleep 1
   done
-  stop_project_native
-  fail "基本前後端未能在預期時間內啟動。"
+  stop_native_processes
+  die "基本前後端未能在預期時間內啟動。"
 }
 
-start_app() {
-  load_model_config
-  ensure_app_config
-  if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
-    prepare_models || fail "必要模型尚未就緒。可填寫 deploy/models.env，或手動放入 models/ 對應位置。"
-    select_runtime_ports native
-    start_native
-    return
-  fi
-  preflight
-  prepare_models || fail "必要模型尚未就緒。可填寫 deploy/models.env，或手動放入 models/ 對應位置。"
-  select_runtime_ports docker
-  # Never take down the working native service before a first Docker build has
-  # completed. A failed build must not leave the user without a WebUI.
-  if ! "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
-    say "首次啟動：先完成 Docker 映像建置，現有服務會保持運作。"
-    compose_cmd build
-  fi
-  stop_project_native
-  compose_cmd up -d --no-build
-  say "等待服務健康檢查……"
-  local i
-  for i in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${FRONTEND_PORT:-5174}/" >/dev/null 2>&1; then
-      save_port_state docker
-      announce_runtime_ports "SlideAI 已啟動。"
-      return 0
-    fi
-    sleep 2
-  done
-  compose_cmd ps
-  fail "服務未在預期時間內就緒，請執行 ./slideai.sh logs。"
+check_native_runtimes() {
+  local nano_python="${VOXTTS_RUNTIME_PYTHON_HOST_PATH:-}"
+  local qwen_python="${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH:-}"
+  [[ -x "${nano_python}" ]] || { warn "Nano runtime Python 不存在：${nano_python:-<未設定>}"; return 1; }
+  [[ -x "${qwen_python}" ]] || { warn "Qwen runtime Python 不存在：${qwen_python:-<未設定>}"; return 1; }
+  "${nano_python}" -c 'import nanovllm_voxcpm' >/dev/null 2>&1 \
+    || { warn "Nano runtime 無法匯入 nanovllm_voxcpm。"; return 1; }
+  "${qwen_python}" -c 'import qwen_asr' >/dev/null 2>&1 \
+    || { warn "Qwen runtime 無法匯入 qwen_asr。"; return 1; }
 }
 
-start_native() {
-  local backend_port="${BACKEND_PORT:-8002}"
-  local frontend_port="${FRONTEND_PORT:-5174}"
-  check_native_runtimes
-  command -v npm >/dev/null 2>&1 || fail "Native 模式需要 Node.js/npm。"
-  [[ -x "${PROJECT_ROOT}/backend/.venv/bin/python" ]] || fail "缺少 backend/.venv。"
-  if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
-    && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
-    save_port_state native
-    announce_runtime_ports "SlideAI 已在 native 模式運作。"
-    return
-  fi
-  stop_project_native
+start_native_services() {
+  required_models_ready
+  check_native_runtimes || die "Native 語音環境尚未就緒，請先執行建制或設定。"
+  prepare_basic_runtime
+  select_runtime_ports native
+  local backend_port="${BACKEND_PORT}" frontend_port="${FRONTEND_PORT}" lan_ip attempt
+  lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  stop_native_processes
   (
     set -a
     # shellcheck disable=SC1090
     source "${BACKEND_ENV}"
+    source "${MODEL_ENV}"
     set +a
-    # Preserve the original local-demo semantics from the previous launcher:
-    # PDF/TTS workflow remains usable without an OAuth token on this internal
-    # deployment, while explicit production deployments can set this false.
     export VIDEO_ABSTRACT_LOCAL_ONLY="${VIDEO_ABSTRACT_LOCAL_ONLY:-true}"
     export VIDEO_ABSTRACT_MOCK_MODE="${VIDEO_ABSTRACT_MOCK_MODE:-false}"
-    export SLIDEAI_TTS_PROVIDER SLIDEAI_ASR_PROVIDER SLIDEAI_ALIGNMENT_PROVIDER
-    export VOXTTS_NANO_TIMESTEPS VOXTTS_NANO_GPU_MEMORY_UTILIZATION
-    export VOXTTS_NANO_IDLE_TIMEOUT_SEC QWEN3_ALIGNMENT_IDLE_TIMEOUT_SEC
-    export VOXTTS_MODEL_PATH="${VOXTTS_MODEL_HOST_PATH}"
-    export QWEN3_ASR_MODEL_PATH="${QWEN3_ASR_MODEL_HOST_PATH}"
-    export QWEN3_ALIGNER_MODEL_PATH="${QWEN3_ALIGNER_MODEL_HOST_PATH}"
-    export QWEN3_TTS_MODEL_PATH="${QWEN3_TTS_MODEL_HOST_PATH}"
+    export VOXTTS_MODEL_PATH="$(absolute_path "${VOXTTS_MODEL_HOST_PATH}")"
+    export QWEN3_ASR_MODEL_PATH="$(absolute_path "${QWEN3_ASR_MODEL_HOST_PATH}")"
+    export QWEN3_ALIGNER_MODEL_PATH="$(absolute_path "${QWEN3_ALIGNER_MODEL_HOST_PATH}")"
+    export QWEN3_TTS_MODEL_PATH="$(absolute_path "${QWEN3_TTS_MODEL_HOST_PATH}")"
     export VOXTTS_ENGINE=nano_vllm
     export VOXTTS_RUNTIME_PYTHON="${VOXTTS_RUNTIME_PYTHON_HOST_PATH}"
     export QWEN3_ASR_RUNTIME_PYTHON="${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH}"
     export QWEN3_TTS_RUNTIME_PYTHON="${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH}"
     export VOXTTS_NANO_WORKER_PATH="${PROJECT_ROOT}/backend/app/workers/nano_voxcpm_worker.py"
     export SLIDEAI_VIDEO_RUNS_DIR="${PROJECT_ROOT}/data/video_runs"
-    local lan_ip
-    lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     export FRONTEND_URL="http://127.0.0.1:${frontend_port},http://localhost:${frontend_port}"
     [[ -n "${lan_ip}" ]] && export FRONTEND_URL="${FRONTEND_URL},http://${lan_ip}:${frontend_port}"
     nohup setsid "${PROJECT_ROOT}/backend/.venv/bin/python" -m uvicorn \
-      backend.app.main:app --host 0.0.0.0 --port "${backend_port}" \
+      backend.app.main:app --host 0.0.0.0 --port "${backend_port}" --no-access-log \
       >/dev/null 2>&1 < /dev/null &
   )
   (
     cd "${PROJECT_ROOT}/frontend"
-    VITE_API_BASE_URL="/api" npm run build >/dev/null
+    VITE_API_BASE_URL=/api npm run build >/dev/null
     VITE_API_PROXY_TARGET="http://127.0.0.1:${backend_port}" \
       nohup setsid npm run preview -- --host 0.0.0.0 --port "${frontend_port}" --strictPort \
       >/dev/null 2>&1 < /dev/null &
   )
-  local i
-  for i in $(seq 1 45); do
-    if curl -fsS "http://127.0.0.1:${backend_port}/docs" >/dev/null 2>&1 \
+  for attempt in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${backend_port}/api/health" >/dev/null 2>&1 \
       && curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1; then
       save_port_state native
-      announce_runtime_ports "SlideAI 已以既有本機環境啟動。"
-      return
+      announce_runtime_ports "SlideAI 已以 Native 模式啟動"
+      return 0
     fi
     sleep 1
   done
-  fail "Native 服務未能啟動。"
+  die "Native 服務未能在預期時間內啟動。"
 }
 
-stop_app() {
-  read_port_state || true
-  [[ -n "${ACTIVE_FRONTEND_PORT:-}" ]] && FRONTEND_PORT="${ACTIVE_FRONTEND_PORT}"
-  [[ -n "${ACTIVE_BACKEND_PORT:-}" ]] && BACKEND_PORT="${ACTIVE_BACKEND_PORT}"
-  export FRONTEND_PORT BACKEND_PORT
-  load_model_config 1
-  stop_project_native
-  if [[ "${ACTIVE_DEPLOY_MODE:-}" == "app-only" || "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
-    clear_port_state
-    say "SlideAI 已停止。"
-    return
+start_docker_services() {
+  required_models_ready
+  docker_access || die "Docker daemon 或 Compose 無法使用；請先執行建制。"
+  nvidia_runtime_ready || die "Docker 尚未備妥 NVIDIA Container Runtime。"
+  select_runtime_ports docker
+  if ! "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
+    info "首次啟動需建立 Docker 映像……"
+    compose build
   fi
-  if command -v docker >/dev/null 2>&1; then
-    if docker info >/dev/null 2>&1; then
-      DOCKER=(docker)
-      compose_cmd down
-    elif sudo -n docker info >/dev/null 2>&1; then
-      DOCKER=(sudo docker)
-      compose_cmd down
-    else
-      warn "Docker daemon 無權限存取；若仍有容器，請執行 sudo ./slideai.sh stop。"
+  stop_native_processes
+  compose up -d --no-build
+  local attempt
+  for attempt in $(seq 1 90); do
+    if curl -fsS "http://127.0.0.1:${BACKEND_PORT}/api/health" >/dev/null 2>&1 \
+      && curl -fsS "http://127.0.0.1:${FRONTEND_PORT}/" >/dev/null 2>&1; then
+      save_port_state docker
+      announce_runtime_ports "SlideAI 已以 Docker 模式啟動"
+      return 0
     fi
+    sleep 2
+  done
+  compose ps || true
+  die "Docker 服務未能在預期時間內通過健康檢查。"
+}
+
+start_services() {
+  ensure_secret_key
+  load_model_settings
+  case "${SLIDEAI_DEPLOY_MODE:-docker}" in
+    native) start_native_services ;;
+    docker) start_docker_services ;;
+    *) die "未知部署模式：${SLIDEAI_DEPLOY_MODE}" ;;
+  esac
+}
+
+stop_services() {
+  read_port_state || true
+  FRONTEND_PORT="${ACTIVE_FRONTEND_PORT:-${FRONTEND_PORT:-5174}}"
+  BACKEND_PORT="${ACTIVE_BACKEND_PORT:-${BACKEND_PORT:-8002}}"
+  export FRONTEND_PORT BACKEND_PORT
+  stop_native_processes
+  load_model_settings
+  if [[ "${ACTIVE_DEPLOY_MODE:-}" == "docker" || "${SLIDEAI_DEPLOY_MODE:-docker}" == "docker" ]]; then
+    if docker_access; then compose down; else warn "無法存取 Docker；可能仍有容器運作。"; fi
   fi
   clear_port_state
-  say "SlideAI 已停止。"
+  ok "SlideAI 已停止"
 }
 
-check_only() {
-  local failed=0
-  load_model_config 1
-  is_ubuntu && say "[OK] Ubuntu" || { warn "非 Ubuntu"; failed=1; }
+restart_services() {
+  stop_services
+  start_services
+}
+
+host_preflight() {
+  local kernel arch available_kb available_gb
+  kernel="$(uname -s 2>/dev/null || true)"
+  arch="$(uname -m 2>/dev/null || true)"
+  [[ "${kernel}" == "Linux" ]] || {
+    warn "目前建制映像只支援 Linux；偵測到：${kernel:-unknown}。"
+    return 1
+  }
+  case "${arch}" in
+    x86_64|amd64) ok "Linux x86_64 主機" ;;
+    *)
+      warn "目前 GPU Dockerfile 使用 x86_64 專用 Flash Attention wheel，不支援 ${arch:-unknown}。"
+      return 1
+      ;;
+  esac
+
+  available_kb="$(df -Pk "${PROJECT_ROOT}" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ "${available_kb}" =~ ^[0-9]+$ ]]; then
+    available_gb=$((available_kb / 1024 / 1024))
+    if (( available_gb < 25 )); then
+      warn "可用磁碟約 ${available_gb}GB；完整 Docker 映像、模型與建置快取建議至少預留 25GB。"
+    else
+      ok "可用磁碟：約 ${available_gb}GB"
+    fi
+  fi
+
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    say "[OK] NVIDIA driver / GPU"
+    local gpu_name driver_version gpu_memory_mb
+    gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1)"
+    driver_version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n 1)"
+    gpu_memory_mb="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 | tr -d ' ')"
+    ok "NVIDIA GPU：${gpu_name:-detected}（driver ${driver_version:-unknown}，VRAM ${gpu_memory_mb:-unknown}MB）"
+    if [[ "${gpu_memory_mb}" =~ ^[0-9]+$ ]] && (( gpu_memory_mb < 14000 )); then
+      warn "VRAM 低於約 14GB；預設 VoxCPM Nano 可能需要降低 GPU memory utilization、縮短文本或改用其他 TTS。"
+    fi
   else
-    warn "NVIDIA 驅動或 GPU 無法使用"
-    failed=1
+    warn "未偵測到可用的 NVIDIA driver/GPU。"
+    warn "前後端映像仍可建置，但目前 VoxCPM Nano、Qwen ASR 與強制對齊映像不保證可在 CPU/AMD GPU 執行。"
   fi
-  check_models_only || failed=1
-  if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
-    say "[INFO] 部署模式：native（不會下載 Docker 語音環境）"
-    check_native_runtimes || failed=1
-    return "${failed}"
-  fi
-  command -v docker >/dev/null 2>&1 && say "[OK] Docker CLI" || { warn "缺少 Docker"; failed=1; }
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    say "[OK] Docker daemon"
-    docker compose version >/dev/null 2>&1 && say "[OK] Compose v2" || { warn "缺少 Compose v2"; failed=1; }
-    check_gpu_runtime && say "[OK] NVIDIA Container Toolkit" || failed=1
-  else
-    warn "Docker daemon 無法存取"
-    say "處理方式：sudo usermod -aG docker \"${USER}\"，之後登出再登入。"
-    failed=1
-  fi
-  return "${failed}"
 }
 
-setup_app() {
-  load_model_config
-  ensure_app_config
-  if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
-    prepare_models || fail "仍缺少必要模型。"
-    check_native_runtimes
+install_docker() {
+  [[ -r /etc/os-release ]] || { warn "無法辨識作業系統。"; return 1; }
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  [[ "${ID:-}" == "ubuntu" || "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* ]] || {
+    warn "自動安裝目前只支援 Ubuntu/Debian。${PRETTY_NAME:+ 偵測到 ${PRETTY_NAME}。}"
+    warn "其他 Linux 發行版請先依官方方式安裝 Docker Engine + Compose v2，再重新執行建制。"
+    return 1
+  }
+  say "即將透過 Debian/Ubuntu 套件安裝 Docker Engine 與 Compose v2。"
+  confirm "確定繼續？" yes || return 1
+  sudo apt-get update
+  sudo apt-get install -y docker.io
+  if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+    sudo apt-get install -y docker-compose-v2
   else
-    preflight
-    prepare_models || fail "仍缺少必要模型。"
+    sudo apt-get install -y docker-compose-plugin
   fi
-  say "部署環境已準備完成。"
+  sudo systemctl enable --now docker
+  if ! docker info >/dev/null 2>&1; then
+    sudo usermod -aG docker "${USER}"
+    DOCKER=(sudo docker)
+    warn "已將 ${USER} 加入 docker 群組；重新登入後可不使用 sudo。"
+  fi
 }
 
-status_app() {
-  read_port_state || true
-  local frontend_port="${ACTIVE_FRONTEND_PORT:-${FRONTEND_PORT:-5174}}"
-  local backend_port="${ACTIVE_BACKEND_PORT:-${BACKEND_PORT:-8002}}"
-  printf 'Frontend %s: ' "${frontend_port}"
-  curl -fsS "http://127.0.0.1:${frontend_port}/" >/dev/null 2>&1 && say "running" || say "stopped"
-  printf 'Backend %s: ' "${backend_port}"
-  curl -fsS "http://127.0.0.1:${backend_port}/api/health" >/dev/null 2>&1 && say "running" || say "stopped"
-  load_model_config 1
-  if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
-    :
-  elif [[ "${ACTIVE_DEPLOY_MODE:-}" == "app-only" ]]; then
-    :
-  else
-    check_docker
-    compose_cmd ps
+nvidia_runtime_ready() {
+  docker_access || return 1
+  "${DOCKER[@]}" info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'
+}
+
+install_nvidia_container_toolkit() {
+  [[ -r /etc/os-release ]] || { warn "無法辨識作業系統。"; return 1; }
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  [[ "${ID:-}" == "ubuntu" || "${ID:-}" == "debian" || "${ID_LIKE:-}" == *debian* ]] || {
+    warn "NVIDIA Container Toolkit 自動安裝目前只支援 Ubuntu/Debian。"
+    return 1
+  }
+  command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1 || {
+    warn "請先安裝並確認 NVIDIA driver；腳本不會自動更換主機 driver。"
+    return 1
+  }
+  say "即將依 NVIDIA 官方 stable repository 安裝 Container Toolkit 1.19.1。"
+  confirm "確定安裝並重新啟動 Docker daemon？" yes || return 1
+  sudo apt-get update
+  sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2
+  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+    | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+    | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+    | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+  sudo apt-get update
+  local toolkit_version="1.19.1-1"
+  sudo apt-get install -y \
+    "nvidia-container-toolkit=${toolkit_version}" \
+    "nvidia-container-toolkit-base=${toolkit_version}" \
+    "libnvidia-container-tools=${toolkit_version}" \
+    "libnvidia-container1=${toolkit_version}"
+  sudo nvidia-ctk runtime configure --runtime=docker
+  sudo systemctl restart docker
+  docker_access || return 1
+  nvidia_runtime_ready || { warn "Toolkit 已安裝，但 Docker 尚未回報 nvidia runtime。"; return 1; }
+  ok "NVIDIA Container Toolkit / Docker runtime"
+}
+
+ensure_docker_for_build() {
+  if docker_access; then
+    ok "Docker Engine / Compose v2"
+    return 0
   fi
-  command -v nvidia-smi >/dev/null 2>&1 \
-    && nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader || true
+  warn "Docker 尚未安裝、daemon 未啟動，或目前帳號沒有權限。"
+  confirm "是否現在部署 Docker 前後端環境？" yes || return 1
+  command -v docker >/dev/null 2>&1 || install_docker || return 1
+  if ! docker_access; then
+    if sudo docker info >/dev/null 2>&1; then
+      DOCKER=(sudo docker)
+    else
+      warn "Docker daemon 仍無法使用。"
+      return 1
+    fi
+  fi
+  ok "Docker Engine / Compose v2"
+}
+
+model_ready() {
+  local target="$1"
+  [[ -d "${target}" && -f "${target}/config.json" ]] || return 1
+  find "${target}" -maxdepth 2 -type f \
+    \( -name '*.safetensors' -o -name '*.pth' -o -name '*.bin' \) \
+    -print -quit 2>/dev/null | grep -q .
+}
+
+hf_download() {
+  local repository="$1" target="$2"
+  mkdir -p "${target}"
+  if command -v hf >/dev/null 2>&1; then
+    hf download "${repository}" --local-dir "${target}"
+    return
+  fi
+  if docker_access; then
+    info "未找到 hf CLI，使用一次性 Docker 下載器。"
+    "${DOCKER[@]}" run --rm \
+      --user "$(id -u):$(id -g)" \
+      -e HF_REPO="${repository}" \
+      -e HF_TOKEN \
+      -v "${target}:/download" \
+      python:3.12-slim \
+      sh -c 'python -m pip install --quiet --no-cache-dir huggingface_hub && hf download "$HF_REPO" --local-dir /download'
+    return
+  fi
+  warn "自動下載需要 hf CLI 或可用的 Docker。"
+  return 1
+}
+
+download_model_source() {
+  local source="$1" target="$2"
+  if [[ "${source}" == hf:* ]]; then
+    hf_download "${source#hf:}" "${target}"
+  elif [[ -d "${source}" ]]; then
+    mkdir -p "${target}"
+    cp -a "${source}/." "${target}/"
+  else
+    warn "slideai.sh 自動安裝目前支援 hf:repo 或既有本機資料夾。"
+    warn "目前來源：${source:-<未設定>}"
+    return 1
+  fi
+}
+
+model_wizard() {
+  local label="$1" path_key="$2" source_key="$3" default_path="$4" optional="${5:-0}"
+  load_model_settings
+  local configured source target choice custom
+  configured="${!path_key:-${default_path}}"
+  source="${!source_key:-}"
+  target="$(absolute_path "${configured}")"
+
+  if model_ready "${target}"; then
+    ok "${label}：${target}"
+    return 0
+  fi
+
+  warn "${label} 尚未就緒：${target}"
+  cat <<EOF
+  1) 自動下載至預設位置：${default_path}
+  2) 指定既有模型資料夾
+  3) 暫時跳過
+EOF
+  read -r -p "請選擇 [1-3]：" choice
+  case "${choice:-3}" in
+    1)
+      target="$(absolute_path "${default_path}")"
+      say "來源：${source:-<未設定>}"
+      say "位置：${target}"
+      confirm "確認下載 ${label}？" yes || { skip "${label}"; return "${optional}"; }
+      [[ -n "${source}" ]] || { warn "${source_key} 未設定。"; return 1; }
+      download_model_source "${source}" "${target}" || return 1
+      model_ready "${target}" || { warn "下載完成但模型結構檢查未通過。"; return 1; }
+      set_env_value "${MODEL_ENV}" "${path_key}" "${target}"
+      ok "${label} 已完成"
+      ;;
+    2)
+      read -r -p "請輸入 ${label} 的完整資料夾路徑：" custom
+      [[ -n "${custom}" ]] || { warn "未輸入路徑。"; return 1; }
+      target="$(absolute_path "${custom}")"
+      if ! model_ready "${target}"; then
+        warn "路徑檢查失敗；需要 config.json 與模型權重：${target}"
+        return 1
+      fi
+      set_env_value "${MODEL_ENV}" "${path_key}" "${target}"
+      ok "${label} 已連結至 ${target}"
+      ;;
+    3|"") skip "${label}"; return 0 ;;
+    *) warn "無效選項，已跳過 ${label}。"; return 0 ;;
+  esac
+}
+
+infer_llm_provider() {
+  local key="$1" lower="${1,,}"
+  [[ -n "${key}" ]] || { printf '未設定'; return; }
+  case "${lower}" in
+    sk-ant*) printf 'Anthropic' ;;
+    sk-or-v1*) printf 'OpenRouter' ;;
+    xai-*) printf 'xAI' ;;
+    gsk_*) printf 'Groq' ;;
+    sk*) printf 'OpenAI' ;;
+    ai*|aq.*) printf 'Google Gemini' ;;
+    *) printf '未知前綴' ;;
+  esac
+}
+
+clear_llm_api_keys() {
+  local env_key
+  for env_key in api_key GOOGLE_API_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENROUTER_API_KEY XAI_API_KEY GROQ_API_KEY CUSTOM_LLM_API_KEY EXTERNAL_LLM_API_KEY; do
+    set_env_value "${BACKEND_ENV}" "${env_key}" ""
+  done
+}
+
+llm_wizard() {
+  ensure_config_files
+  local choice provider provider_id key_var model_var default_model key model endpoint
+  cat <<'EOF'
+LLM API 設定
+  1) Google Gemini
+  2) OpenAI
+  3) Anthropic Claude
+  4) OpenRouter
+  5) xAI
+  6) Groq
+  7) 自訂 OpenAI-compatible API（本地或其他服務）
+  8) 清除目前 API key
+  0) 暫時跳過
+EOF
+  read -r -p "請選擇 [0-8]：" choice
+  case "${choice}" in
+    1) provider="Google Gemini"; provider_id="google"; key_var="GOOGLE_API_KEY"; model_var="GOOGLE_GENERATIVE_MODEL"; default_model="gemini-2.5-flash" ;;
+    2) provider="OpenAI"; provider_id="openai"; key_var="OPENAI_API_KEY"; model_var="OPENAI_MODEL"; default_model="gpt-4.1-mini" ;;
+    3) provider="Anthropic Claude"; provider_id="anthropic"; key_var="ANTHROPIC_API_KEY"; model_var="ANTHROPIC_MODEL"; default_model="claude-3-5-sonnet-latest" ;;
+    4) provider="OpenRouter"; provider_id="openrouter"; key_var="OPENROUTER_API_KEY"; model_var="OPENROUTER_MODEL"; default_model="openai/gpt-4.1-mini" ;;
+    5) provider="xAI"; provider_id="xai"; key_var="XAI_API_KEY"; model_var="XAI_MODEL"; default_model="grok-3-mini" ;;
+    6) provider="Groq"; provider_id="groq"; key_var="GROQ_API_KEY"; model_var="GROQ_MODEL"; default_model="llama-3.3-70b-versatile" ;;
+    7)
+      provider="自訂 OpenAI-compatible API"
+      provider_id="custom"
+      read -r -p "完整 chat/completions URL（例如 http://127.0.0.1:8081/v1/chat/completions）：" endpoint
+      [[ "${endpoint}" =~ ^https?://[^[:space:]]+$ ]] || { warn "Endpoint 必須是 http:// 或 https:// 的完整 URL。"; return 1; }
+      read -r -p "模型名稱／alias：" model
+      [[ -n "${model}" ]] || { warn "自訂 API 必須指定模型名稱。"; return 1; }
+      read -r -s -p "API key（本地無驗證服務可直接 Enter）：" key
+      printf '\n'
+      say "Provider：${provider}"
+      say "Endpoint：${endpoint}"
+      say "Model：${model}"
+      confirm "確認儲存至 backend/.env？" yes || { skip "LLM API 設定"; return 0; }
+      clear_llm_api_keys
+      set_env_value "${BACKEND_ENV}" LLM_PROVIDER "custom"
+      set_env_value "${BACKEND_ENV}" CUSTOM_LLM_ENDPOINT "${endpoint}"
+      set_env_value "${BACKEND_ENV}" CUSTOM_LLM_MODEL "${model}"
+      set_env_value "${BACKEND_ENV}" CUSTOM_LLM_API_KEY "${key}"
+      set_env_value "${BACKEND_ENV}" api_key "${key}"
+      ok "LLM 已設定：custom / ${model}"
+      return 0
+      ;;
+    8)
+      confirm "確定清除目前儲存的所有 LLM API key？" no || { skip "清除 API key"; return 0; }
+      clear_llm_api_keys
+      set_env_value "${BACKEND_ENV}" LLM_PROVIDER ""
+      ok "API key 已清除"
+      return 0
+      ;;
+    0|"") skip "LLM API 設定"; return 0 ;;
+    *) warn "無效選項。"; return 1 ;;
+  esac
+
+  read -r -s -p "請輸入 ${provider} API key（輸入不會顯示）：" key
+  printf '\n'
+  [[ -n "${key}" ]] || { warn "API key 為空，未修改設定。"; return 1; }
+  read -r -p "模型名稱 [${default_model}]：" model
+  model="${model:-${default_model}}"
+  say "Provider：${provider}"
+  say "Model：${model}"
+  confirm "確認儲存至 backend/.env？" yes || { skip "LLM API 設定"; return 0; }
+
+  # Store an explicit provider instead of relying only on vendor-specific key
+  # prefixes. This also supports newly issued keys whose prefix may change.
+  clear_llm_api_keys
+  set_env_value "${BACKEND_ENV}" LLM_PROVIDER "${provider_id}"
+  set_env_value "${BACKEND_ENV}" api_key "${key}"
+  set_env_value "${BACKEND_ENV}" "${key_var}" "${key}"
+  set_env_value "${BACKEND_ENV}" "${model_var}" "${model}"
+  ok "LLM 已設定：${provider} / ${model}"
+}
+
+configure_deployment() {
+  ensure_config_files
+  local mode frontend backend
+  say "目前部署模式：$(env_value "${MODEL_ENV}" SLIDEAI_DEPLOY_MODE 2>/dev/null || printf 'docker')"
+  cat <<'EOF'
+  1) Docker（建議用於新環境）
+  2) Native（沿用既有本機 venv）
+  3) 只修改預設 ports
+  0) 返回
+EOF
+  read -r -p "請選擇 [0-3]：" mode
+  case "${mode}" in
+    1) set_env_value "${MODEL_ENV}" SLIDEAI_DEPLOY_MODE docker; ok "已設定 Docker 模式" ;;
+    2) set_env_value "${MODEL_ENV}" SLIDEAI_DEPLOY_MODE native; ok "已設定 Native 模式" ;;
+    3) ;;
+    0|"") return 0 ;;
+    *) warn "無效選項。"; return 1 ;;
+  esac
+  if confirm "是否修改預設 ports？" no; then
+    read -r -p "前端 port [5174]：" frontend
+    read -r -p "後端 port [8002]：" backend
+    frontend="${frontend:-5174}"; backend="${backend:-8002}"
+    [[ "${frontend}" =~ ^[0-9]{4,5}$ && "${backend}" =~ ^[0-9]{4,5}$ ]] || { warn "Port 格式錯誤。"; return 1; }
+    [[ "${frontend}" != "${backend}" ]] || { warn "前後端不可使用相同 port。"; return 1; }
+    set_env_value "${MODEL_ENV}" FRONTEND_PORT "${frontend}"
+    set_env_value "${MODEL_ENV}" BACKEND_PORT "${backend}"
+    ok "預設 ports：frontend ${frontend} / backend ${backend}"
+  fi
+}
+
+configure_runtime() {
+  ensure_config_files
+  local timesteps memory idle align_idle
+  read -r -p "VoxCPM inference timesteps [12]：" timesteps
+  read -r -p "Nano-vLLM GPU memory utilization [0.50]：" memory
+  read -r -p "TTS 閒置卸載秒數 [120]：" idle
+  read -r -p "強制對齊閒置卸載秒數 [60]：" align_idle
+  timesteps="${timesteps:-12}"; memory="${memory:-0.50}"
+  idle="${idle:-120}"; align_idle="${align_idle:-60}"
+  [[ "${timesteps}" =~ ^[0-9]+$ ]] || { warn "timesteps 必須是整數。"; return 1; }
+  [[ "${memory}" =~ ^0(\.[0-9]+)?$|^1(\.0+)?$ ]] || { warn "GPU memory utilization 必須介於 0 與 1。"; return 1; }
+  [[ "${idle}" =~ ^[0-9]+$ && "${align_idle}" =~ ^[0-9]+$ ]] || { warn "卸載時間必須是整數秒。"; return 1; }
+  set_env_value "${MODEL_ENV}" VOXTTS_NANO_TIMESTEPS "${timesteps}"
+  set_env_value "${MODEL_ENV}" VOXTTS_NANO_GPU_MEMORY_UTILIZATION "${memory}"
+  set_env_value "${MODEL_ENV}" VOXTTS_NANO_IDLE_TIMEOUT_SEC "${idle}"
+  set_env_value "${MODEL_ENV}" QWEN3_ALIGNMENT_IDLE_TIMEOUT_SEC "${align_idle}"
+  ok "語音 runtime 參數已更新"
+}
+
+settings_menu() {
+  ensure_config_files
+  local choice
+  while true; do
+    line
+    cat <<'EOF'
+設定
+  1) 部署模式與 ports
+  2) TTS 模型
+  3) ASR 模型
+  4) 強制對齊模型
+  5) LLM API
+  6) 語音 runtime 參數
+  0) 返回
+EOF
+    read -r -p "請選擇 [0-6]：" choice
+    case "${choice}" in
+      1) configure_deployment || true ;;
+      2) model_wizard "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE "./models/tts/VoxCPM2" 0 || true ;;
+      3) model_wizard "Qwen3 ASR" QWEN3_ASR_MODEL_HOST_PATH QWEN3_ASR_SOURCE "./models/asr/Qwen3-ASR-1.7B" 0 || true ;;
+      4) model_wizard "Qwen3 ForcedAligner" QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_ALIGNER_SOURCE "./models/alignment/Qwen3-ForcedAligner-0.6B" 0 || true ;;
+      5) llm_wizard || true ;;
+      6) configure_runtime || true ;;
+      0|"") return 0 ;;
+      *) warn "無效選項。" ;;
+    esac
+  done
+}
+
+build_frontend_backend() {
+  load_model_settings
+  local frontend="${FRONTEND_PORT:-5174}" backend="${BACKEND_PORT:-8002}" gpu_runtime=0
+  if curl -fsS "http://127.0.0.1:${frontend}/" >/dev/null 2>&1 \
+    && curl -fsS "http://127.0.0.1:${backend}/api/health" >/dev/null 2>&1; then
+    ok "前後端目前可正常開啟（frontend ${frontend} / backend ${backend}）"
+    confirm "是否仍要重新建置 Docker 映像？" no || return 0
+  fi
+  if ! ensure_docker_for_build; then
+    skip "Docker 前後端建制"
+    return 0
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    ok "NVIDIA driver / GPU"
+    if nvidia_runtime_ready; then
+      gpu_runtime=1
+      ok "NVIDIA Container Runtime"
+    else
+      warn "Docker 尚未註冊 NVIDIA Container Runtime。"
+      install_nvidia_container_toolkit && gpu_runtime=1 || skip "NVIDIA Container Toolkit"
+    fi
+  else
+    warn "未偵測到 NVIDIA GPU；前後端可建置，但語音模型無法使用 GPU。"
+  fi
+
+  if "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
+    ok "SlideAI Docker 映像已存在"
+    confirm "是否重新建置映像？" no || return 0
+  else
+    confirm "是否開始建置 SlideAI 前後端 Docker 映像？" yes || { skip "Docker 映像建置"; return 0; }
+  fi
+  compose build
+  ok "Docker 前後端映像建置完成"
+  if confirm "是否立即啟動並驗證前後端？" yes; then
+    if (( gpu_runtime == 0 )); then
+      warn "目前 Compose backend 要求 NVIDIA runtime，無法啟動完整 Docker 工作流。"
+      if confirm "是否改以基礎前後端模式啟動（不含 LLM/TTS/ASR）？" yes; then
+        start_basic_services
+      else
+        skip "啟動服務；Docker 映像已保留"
+      fi
+      return 0
+    fi
+    # Compose creates absent bind-mount sources as root-owned directories.
+    # Create the configured model placeholders as the current user first so a
+    # later Hugging Face download can write into them normally.
+    local model_key model_path
+    for model_key in VOXTTS_MODEL_HOST_PATH QWEN3_ASR_MODEL_HOST_PATH QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_TTS_MODEL_HOST_PATH; do
+      model_path="$(absolute_path "${!model_key:-}")"
+      [[ -n "${!model_key:-}" ]] && mkdir -p "${model_path}"
+    done
+    compose up -d --no-build
+    info "等待前後端健康檢查……"
+    local attempt
+    for attempt in $(seq 1 90); do
+      if curl -fsS "http://127.0.0.1:${frontend}/" >/dev/null 2>&1 \
+        && curl -fsS "http://127.0.0.1:${backend}/api/health" >/dev/null 2>&1; then
+        mkdir -p "$(dirname "${PORT_STATE}")"
+        {
+          printf 'FRONTEND_PORT=%s\n' "${frontend}"
+          printf 'BACKEND_PORT=%s\n' "${backend}"
+          printf 'DEPLOY_MODE=docker\n'
+        } > "${PORT_STATE}"
+        ok "前後端實際啟動驗證通過"
+        return 0
+      fi
+      sleep 2
+    done
+    compose ps || true
+    warn "映像建置成功，但服務未在三分鐘內通過 health check。"
+    return 1
+  fi
+}
+
+build_wizard() {
+  is_interactive || die "建制精靈需要互動式終端。"
+  ensure_config_files
+  ensure_secret_key
+  line
+  say "SlideAI 首次建制精靈"
+  say "每個階段都可以跳過；進行下載或安裝前會再次確認。"
+  line
+
+  host_preflight || {
+    warn "主機不符合目前完整 GPU 映像的自動建制條件。"
+    confirm "是否仍繼續嘗試建置基本前後端？" no || return 1
+  }
+
+  say "步驟 1/5：前後端與 Docker"
+  build_frontend_backend || warn "前後端環境尚未完成，繼續檢查其他項目。"
+
+  line; say "步驟 2/5：TTS"
+  model_wizard "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE "./models/tts/VoxCPM2" 0 || warn "TTS 尚未完成。"
+
+  line; say "步驟 3/5：ASR"
+  model_wizard "Qwen3 ASR" QWEN3_ASR_MODEL_HOST_PATH QWEN3_ASR_SOURCE "./models/asr/Qwen3-ASR-1.7B" 0 || warn "ASR 尚未完成。"
+
+  line; say "步驟 4/5：強制對齊"
+  model_wizard "Qwen3 ForcedAligner" QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_ALIGNER_SOURCE "./models/alignment/Qwen3-ForcedAligner-0.6B" 0 || warn "強制對齊尚未完成。"
+  if confirm "是否也設定選用的 Qwen3 TTS？" no; then
+    model_wizard "Qwen3 TTS（選用）" QWEN3_TTS_MODEL_HOST_PATH QWEN3_TTS_SOURCE "./models/tts/Qwen3-TTS-12Hz-1.7B-Base" 1 || true
+  fi
+
+  line; say "步驟 5/5：LLM API"
+  llm_wizard || warn "LLM API 尚未完成；選擇『無』模式時仍可進入基本流程。"
+
+  line
+  say "建制精靈完成。以下為目前狀態："
+  status_report
+  if confirm "是否現在啟動 SlideAI？" yes; then
+    start_services
+  fi
+}
+
+runtime_status() {
+  local label="$1" python_path="$2" module="$3"
+  if [[ -x "${python_path}" ]] && "${python_path}" -c "import ${module}" >/dev/null 2>&1; then
+    ok "${label} runtime：${python_path}"
+  elif [[ -n "${python_path}" ]]; then
+    warn "${label} runtime 無法使用：${python_path}"
+  else
+    info "${label} runtime：Docker 模式由映像提供"
+  fi
+}
+
+status_report() {
+  ensure_config_files
+  load_model_settings
+  local frontend="${FRONTEND_PORT:-5174}" backend="${BACKEND_PORT:-8002}" state_mode=""
+  if [[ -f "${PORT_STATE}" ]]; then
+    # shellcheck disable=SC1090
+    source "${PORT_STATE}"
+    frontend="${FRONTEND_PORT:-${frontend}}"; backend="${BACKEND_PORT:-${backend}}"
+    state_mode="${DEPLOY_MODE:-}"
+  fi
+  line
+  say "服務"
+  say "  部署模式：${state_mode:-${SLIDEAI_DEPLOY_MODE:-docker}}"
+  if curl -fsS "http://127.0.0.1:${frontend}/" >/dev/null 2>&1; then
+    ok "Frontend ${frontend}"
+  else
+    warn "Frontend ${frontend} 未運作"
+  fi
+  if curl -fsS "http://127.0.0.1:${backend}/api/health" >/dev/null 2>&1; then
+    ok "Backend ${backend}"
+  else
+    warn "Backend ${backend} 未運作"
+  fi
+
+  line; say "容器與硬體"
+  if docker_access; then
+    ok "Docker / Compose"
+    compose ps 2>/dev/null || true
+  else
+    warn "Docker daemon 或 Compose 無法使用"
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader | sed 's/^/  GPU：/'
+  else
+    warn "NVIDIA GPU 無法使用"
+  fi
+
+  line; say "模型"
+  local label key value path
+  while IFS='|' read -r label key; do
+    value="${!key:-}"
+    path="$(absolute_path "${value}")"
+    if model_ready "${path}"; then ok "${label}：${path}"; else warn "${label} 缺少或不完整：${path}"; fi
+  done <<'EOF'
+VoxCPM2 TTS|VOXTTS_MODEL_HOST_PATH
+Qwen3 ASR|QWEN3_ASR_MODEL_HOST_PATH
+Qwen3 ForcedAligner|QWEN3_ALIGNER_MODEL_HOST_PATH
+Qwen3 TTS（選用）|QWEN3_TTS_MODEL_HOST_PATH
+EOF
+
+  line; say "執行環境"
+  if [[ "${SLIDEAI_DEPLOY_MODE:-docker}" == "native" ]]; then
+    runtime_status "VoxCPM Nano" "${VOXTTS_RUNTIME_PYTHON_HOST_PATH:-}" nanovllm_voxcpm
+    runtime_status "Qwen Speech" "${QWEN_SPEECH_RUNTIME_PYTHON_HOST_PATH:-}" qwen_asr
+    [[ -x "${PROJECT_ROOT}/backend/.venv/bin/python" ]] && ok "Backend venv" || warn "Backend venv 缺少"
+    [[ -d "${PROJECT_ROOT}/frontend/node_modules" ]] && ok "Frontend node_modules" || warn "Frontend node_modules 缺少"
+  else
+    info "Docker 模式：Backend、VoxCPM Nano、Qwen Speech 環境由映像提供"
+  fi
+
+  line; say "LLM"
+  local key provider llm_model llm_endpoint key_state
+  key="$(env_value "${BACKEND_ENV}" api_key 2>/dev/null || true)"
+  [[ -n "${key}" ]] || key="$(env_value "${BACKEND_ENV}" GOOGLE_API_KEY 2>/dev/null || true)"
+  [[ -n "${key}" ]] || key="$(env_value "${BACKEND_ENV}" OPENAI_API_KEY 2>/dev/null || true)"
+  [[ -n "${key}" ]] || key="$(env_value "${BACKEND_ENV}" ANTHROPIC_API_KEY 2>/dev/null || true)"
+  [[ -n "${key}" ]] || key="$(env_value "${BACKEND_ENV}" OPENROUTER_API_KEY 2>/dev/null || true)"
+  [[ -n "${key}" ]] || key="$(env_value "${BACKEND_ENV}" XAI_API_KEY 2>/dev/null || true)"
+  [[ -n "${key}" ]] || key="$(env_value "${BACKEND_ENV}" GROQ_API_KEY 2>/dev/null || true)"
+  provider="$(env_value "${BACKEND_ENV}" LLM_PROVIDER 2>/dev/null || true)"
+  [[ -n "${provider}" ]] || provider="$(infer_llm_provider "${key}")"
+  if [[ "${provider}" == "custom" ]]; then
+    llm_model="$(env_value "${BACKEND_ENV}" CUSTOM_LLM_MODEL 2>/dev/null || true)"
+    llm_endpoint="$(env_value "${BACKEND_ENV}" CUSTOM_LLM_ENDPOINT 2>/dev/null || true)"
+    if [[ -n "${llm_model}" && -n "${llm_endpoint}" ]]; then
+      if [[ -n "${key}" ]]; then key_state="已設定"; else key_state="未設定（允許本地無驗證服務）"; fi
+      ok "自訂 LLM：${llm_model} / ${llm_endpoint}（API key ${key_state}）"
+    else
+      warn "自訂 LLM 尚缺 model 或 endpoint"
+    fi
+  elif [[ -n "${key}" ]]; then
+    ok "API key 已設定（${provider}；不顯示內容）"
+  else
+    warn "LLM API key 尚未設定"
+  fi
+  line
+}
+
+main_menu() {
+  is_interactive || die "不帶參數時需要互動式終端；可使用 start/stop/restart/status/settings/build。"
+  local choice
+  while true; do
+    clear 2>/dev/null || true
+    cat <<'EOF'
+SlideAI 管理工具
+
+  1) 啟動
+  2) 關閉
+  3) 重新啟動
+  4) 狀態（服務、模型與環境）
+  5) 設定
+  6) 建制（首次安裝精靈）
+  0) 離開
+EOF
+    read -r -p "請選擇 [0-6]：" choice
+    case "${choice}" in
+      1) start_services; pause_screen ;;
+      2) stop_services; pause_screen ;;
+      3) restart_services; pause_screen ;;
+      4) status_report; pause_screen ;;
+      5) settings_menu ;;
+      6) build_wizard; pause_screen ;;
+      0) say "已離開。"; return 0 ;;
+      *) warn "無效選項：${choice}"; sleep 1 ;;
+    esac
+  done
 }
 
 command_name="${1:-}"
-[[ -n "${command_name}" ]] || command_name="$(choose_command)"
-case "${command_name}" in
-  start) start_app ;;
-  app-only) start_app_only ;;
-  build) preflight; prepare_models || fail "仍缺少必要模型。"; compose_cmd build ;;
-  stop) stop_app ;;
-  restart) stop_app; start_app ;;
-  setup) setup_app ;;
-  check) check_only ;;
-  status) status_app ;;
-  logs)
-    load_model_config 1
-    if [[ "${SLIDEAI_DEPLOY_MODE,,}" == "native" ]]; then
-      say "Native 精簡模式不寫入持久 log；請用 ./slideai.sh status 檢查。"
-    else
-      check_docker
-      compose_cmd logs -f --tail=100
-    fi
-    ;;
-  help|-h|--help) usage ;;
-  exit) say "已離開。" ;;
-  *) usage; fail "未知指令：${command_name}" ;;
-esac
+if [[ -z "${command_name}" ]]; then
+  main_menu
+else
+  case "${command_name}" in
+    start) start_services ;;
+    stop) stop_services ;;
+    restart) restart_services ;;
+    status) status_report ;;
+    settings|config) settings_menu ;;
+    build|setup) build_wizard ;;
+    -h|--help|help)
+      say "用法：./slideai.sh [start|stop|restart|status|settings|build]"
+      ;;
+    *) die "未知指令：${command_name}" ;;
+  esac
+fi
