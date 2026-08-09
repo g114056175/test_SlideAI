@@ -200,6 +200,30 @@ docker_images_current() {
   [[ "${backend_revision}" == "${expected}" && "${frontend_revision}" == "${expected}" ]]
 }
 
+compose_service_running_here() {
+  local service="$1" container_id working_dir running
+  container_id="$(compose ps -q "${service}" 2>/dev/null | head -n 1)"
+  [[ -n "${container_id}" ]] || return 1
+  working_dir="$("${DOCKER[@]}" inspect \
+    --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' \
+    "${container_id}" 2>/dev/null || true)"
+  running="$("${DOCKER[@]}" inspect --format '{{.State.Running}}' \
+    "${container_id}" 2>/dev/null || true)"
+  [[ "${running}" == "true" && "${working_dir}" == "${PROJECT_ROOT}" ]]
+}
+
+require_launcher_commands() {
+  local missing=() command_name
+  for command_name in curl python3; do
+    command -v "${command_name}" >/dev/null 2>&1 || missing+=("${command_name}")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    warn "啟動工具缺少必要指令：${missing[*]}"
+    warn "Ubuntu/Debian 可執行：sudo apt-get install -y curl python3"
+    return 1
+  fi
+}
+
 docker_access() {
   command -v docker >/dev/null 2>&1 || return 1
   docker compose version >/dev/null 2>&1 || return 1
@@ -495,6 +519,7 @@ start_docker_services() {
 }
 
 start_services() {
+  require_launcher_commands || die "請先補齊啟動工具後重試。"
   ensure_secret_key
   load_model_settings
   case "${SLIDEAI_DEPLOY_MODE:-docker}" in
@@ -525,6 +550,7 @@ restart_services() {
 
 host_preflight() {
   local kernel arch available_kb available_gb
+  require_launcher_commands || return 1
   kernel="$(uname -s 2>/dev/null || true)"
   arch="$(uname -m 2>/dev/null || true)"
   [[ "${kernel}" == "Linux" ]] || {
@@ -1225,30 +1251,58 @@ status_report() {
   ensure_config_files
   load_model_settings
   local frontend="${FRONTEND_PORT:-5174}" backend="${BACKEND_PORT:-8002}" state_mode=""
+  local deploy_mode docker_ready=0 frontend_owned=1 backend_owned=1
   if [[ -f "${PORT_STATE}" ]]; then
     # shellcheck disable=SC1090
     source "${PORT_STATE}"
     frontend="${FRONTEND_PORT:-${frontend}}"; backend="${BACKEND_PORT:-${backend}}"
     state_mode="${DEPLOY_MODE:-}"
   fi
+  deploy_mode="${state_mode:-${SLIDEAI_DEPLOY_MODE:-docker}}"
+  if [[ "${deploy_mode}" == "docker" ]]; then
+    frontend_owned=0
+    backend_owned=0
+    if docker_access; then
+      docker_ready=1
+      compose_service_running_here frontend && frontend_owned=1
+      compose_service_running_here backend && backend_owned=1
+    fi
+  fi
   line
   say "服務"
-  say "  部署模式：${state_mode:-${SLIDEAI_DEPLOY_MODE:-docker}}"
-  if curl -fsS "http://127.0.0.1:${frontend}/" >/dev/null 2>&1; then
+  say "  部署模式：${deploy_mode}"
+  if curl -fsS "http://127.0.0.1:${frontend}/" >/dev/null 2>&1 \
+    && (( frontend_owned == 1 )); then
     ok "Frontend ${frontend}"
+  elif curl -fsS "http://127.0.0.1:${frontend}/" >/dev/null 2>&1; then
+    warn "Frontend port ${frontend} 有回應，但不屬於目前專案目錄"
   else
     warn "Frontend ${frontend} 未運作"
   fi
-  if curl -fsS "http://127.0.0.1:${backend}/api/health" >/dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:${backend}/api/health" >/dev/null 2>&1 \
+    && (( backend_owned == 1 )); then
     ok "Backend ${backend}"
+  elif curl -fsS "http://127.0.0.1:${backend}/api/health" >/dev/null 2>&1; then
+    warn "Backend port ${backend} 有回應，但不屬於目前專案目錄"
   else
     warn "Backend ${backend} 未運作"
   fi
 
   line; say "容器與硬體"
-  if docker_access; then
+  if (( docker_ready == 1 )) || docker_access; then
     ok "Docker / Compose"
     compose ps 2>/dev/null || true
+    if [[ "${deploy_mode}" == "docker" ]]; then
+      if "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
+        if docker_images_current; then
+          ok "Docker 映像與目前程式碼版本一致"
+        else
+          warn "Docker 映像落後於目前程式碼；下次啟動會自動重建"
+        fi
+      else
+        info "尚未建立 SlideAI Docker 映像"
+      fi
+    fi
   else
     warn "Docker daemon 或 Compose 無法使用"
   fi
