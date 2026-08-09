@@ -118,7 +118,8 @@ curl -sS "$API/api/agent/video-jobs/<run_id>/<job_id>"
 下載到專案的 `models/`。詳細部署與替換 provider 方法請參閱
 [deploy/README.md](deploy/README.md) 與 [docs/SPEECH_ADAPTERS.md](docs/SPEECH_ADAPTERS.md)。
 預設模型都是公開倉庫，不需要 Hugging Face token；只有改用 gated 或私人模型時
-才需要先設定 `HF_TOKEN`。
+才需要 token。建制精靈首次會提供匿名／token 選項，之後可由 `5 設定` 修改；
+token 僅保存在權限為 `0600` 且不進 Git 的 `runtime/hf.env`。
 
 ## 資料與安全
 

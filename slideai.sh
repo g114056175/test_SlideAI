@@ -13,6 +13,7 @@ BACKEND_ENV="${PROJECT_ROOT}/backend/.env"
 BACKEND_ENV_EXAMPLE="${PROJECT_ROOT}/backend/.env.example"
 PORT_STATE="${PROJECT_ROOT}/runtime/ports.env"
 RUNTIME_DIR="${PROJECT_ROOT}/runtime"
+HF_ENV="${RUNTIME_DIR}/hf.env"
 DOCKER=(docker)
 
 cd "${PROJECT_ROOT}"
@@ -143,6 +144,18 @@ load_model_settings() {
   # shellcheck disable=SC1090
   source "${MODEL_ENV}"
   set +a
+}
+
+load_hf_settings() {
+  local inherited_token="${HF_TOKEN:-}"
+  if [[ -f "${HF_ENV}" ]]; then
+    # This file is written only by set_env_value below and is not committed.
+    # shellcheck disable=SC1090
+    source "${HF_ENV}"
+  fi
+  # An explicitly exported token takes precedence over the saved preference.
+  [[ -n "${inherited_token}" ]] && HF_TOKEN="${inherited_token}"
+  export HF_TOKEN="${HF_TOKEN:-}"
 }
 
 compose() {
@@ -282,7 +295,8 @@ Qwen3 ASR|QWEN3_ASR_MODEL_HOST_PATH
 Qwen3 ForcedAligner|QWEN3_ALIGNER_MODEL_HOST_PATH
 EOF
   (( failed == 0 )) || {
-    warn "請先從主選單執行『6 建制』或在『5 設定』指定既有模型。"
+    warn "前後端仍可啟動，但缺少模型的 TTS／ASR／強制對齊功能將無法使用。"
+    warn "可稍後從主選單執行『6 建制』或在『5 設定』指定既有模型。"
     return 1
   }
 }
@@ -360,8 +374,11 @@ check_native_runtimes() {
 }
 
 start_native_services() {
-  required_models_ready
-  check_native_runtimes || die "Native 語音環境尚未就緒，請先執行建制或設定。"
+  if ! required_models_ready || ! check_native_runtimes; then
+    warn "Native 語音環境未完整，改以基本前後端模式啟動。"
+    start_basic_services
+    return
+  fi
   prepare_basic_runtime
   select_runtime_ports native
   local backend_port="${BACKEND_PORT}" frontend_port="${FRONTEND_PORT}" lan_ip attempt
@@ -410,7 +427,7 @@ start_native_services() {
 }
 
 start_docker_services() {
-  required_models_ready
+  required_models_ready || true
   docker_access || die "Docker daemon 或 Compose 無法使用；請先執行建制。"
   nvidia_runtime_ready || die "Docker 尚未備妥 NVIDIA Container Runtime。"
   select_runtime_ports docker
@@ -601,6 +618,7 @@ model_ready() {
 
 hf_download() {
   local repository="$1" target="$2" downloader_venv="${RUNTIME_DIR}/hf-downloader"
+  load_hf_settings
   mkdir -p "${target}"
   if [[ -z "${HF_TOKEN:-}" ]]; then
     info "未設定 HF_TOKEN；公開模型仍可匿名下載，但速率限制會較低。"
@@ -642,6 +660,63 @@ hf_download() {
 
   warn "自動下載需要 Python 3、hf CLI 或可用的 Docker。"
   return 1
+}
+
+configure_hf_token() {
+  local force="${1:-0}" choice token mode
+  mkdir -p "${RUNTIME_DIR}"
+  load_hf_settings
+  mode="$(env_value "${HF_ENV}" HF_AUTH_MODE 2>/dev/null || true)"
+  if [[ "${force}" != "1" && ( -n "${HF_TOKEN:-}" || "${mode}" == "anonymous" ) ]]; then
+    if [[ -n "${HF_TOKEN:-}" ]]; then
+      ok "Hugging Face token 已設定（內容不顯示）"
+    else
+      info "Hugging Face 使用匿名下載（預設公開模型可用）"
+    fi
+    return 0
+  fi
+
+  cat <<'EOF'
+Hugging Face 下載設定
+  預設 VoxCPM2、Qwen3 ASR 與 ForcedAligner 都是公開模型，不需要 token。
+  Token 只用於提高下載限額，或存取 gated／私人模型。
+
+  1) 匿名下載（建議／預設）
+  2) 輸入或更新 HF token
+  3) 清除 token 並改用匿名下載
+  0) 返回
+EOF
+  read -r -p "請選擇 [0-3]：" choice
+  case "${choice:-1}" in
+    1)
+      set_env_value "${HF_ENV}" HF_TOKEN ""
+      set_env_value "${HF_ENV}" HF_AUTH_MODE anonymous
+      chmod 600 "${HF_ENV}"
+      unset HF_TOKEN
+      ok "將使用匿名方式下載公開模型"
+      ;;
+    2)
+      read -r -s -p "請輸入 HF token（輸入不會顯示）：" token
+      printf '\n'
+      [[ -n "${token}" ]] || { warn "Token 為空，未修改設定。"; return 1; }
+      confirm "確認儲存至本機 runtime/hf.env？" yes || { skip "HF token 設定"; return 0; }
+      set_env_value "${HF_ENV}" HF_TOKEN "${token}"
+      set_env_value "${HF_ENV}" HF_AUTH_MODE token
+      chmod 600 "${HF_ENV}"
+      export HF_TOKEN="${token}"
+      ok "Hugging Face token 已儲存（內容不顯示）"
+      ;;
+    3)
+      confirm "確定清除已儲存的 HF token？" no || { skip "清除 HF token"; return 0; }
+      set_env_value "${HF_ENV}" HF_TOKEN ""
+      set_env_value "${HF_ENV}" HF_AUTH_MODE anonymous
+      chmod 600 "${HF_ENV}"
+      unset HF_TOKEN
+      ok "HF token 已清除，改用匿名下載"
+      ;;
+    0) return 0 ;;
+    *) warn "無效選項。"; return 1 ;;
+  esac
 }
 
 download_model_source() {
@@ -940,9 +1015,10 @@ settings_menu() {
   4) 強制對齊模型
   5) LLM API
   6) 語音 runtime 參數
+  7) Hugging Face 下載設定
   0) 返回
 EOF
-    read -r -p "請選擇 [0-6]：" choice
+    read -r -p "請選擇 [0-7]：" choice
     case "${choice}" in
       1) configure_deployment || true ;;
       2)
@@ -953,6 +1029,7 @@ EOF
       4) model_wizard "Qwen3 ForcedAligner" QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_ALIGNER_SOURCE "./models/alignment/Qwen3-ForcedAligner-0.6B" 0 || true ;;
       5) llm_wizard || true ;;
       6) configure_runtime || true ;;
+      7) configure_hf_token 1 || true ;;
       0|"") return 0 ;;
       *) warn "無效選項。" ;;
     esac
@@ -1062,6 +1139,7 @@ build_wizard() {
   fi
 
   line; say "步驟 3/6：TTS 模型"
+  configure_hf_token || warn "Hugging Face 下載設定尚未完成；將嘗試匿名下載。"
   model_wizard "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE "./models/tts/VoxCPM2" 0 || warn "TTS 尚未完成。"
 
   line; say "步驟 4/6：ASR"
