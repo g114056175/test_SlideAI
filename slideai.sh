@@ -416,7 +416,9 @@ start_docker_services() {
   select_runtime_ports docker
   if ! "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
     info "首次啟動需建立 Docker 映像……"
-    compose build
+    if ! compose build; then
+      die "Docker 映像建置失敗；請修正上方錯誤後再重試。"
+    fi
   fi
   stop_native_processes
   compose up -d --no-build
@@ -856,6 +858,27 @@ EOF
   fi
 }
 
+configure_optional_qwen_tts() {
+  ensure_config_files
+  local current choice
+  current="$(env_value "${MODEL_ENV}" QWEN3_TTS_INSTALL 2>/dev/null || printf '0')"
+  line
+  say "Qwen3 TTS 品質備援（目前：$([[ "${current}" == "1" ]] && printf '安裝' || printf '不安裝')）"
+  cat <<'EOF'
+  1) 不安裝（預設；VoxCPM2 主流程不需要）
+  2) 額外安裝 Qwen3 TTS
+     因 Transformers 版本與 Qwen3 ASR 不同，會建立獨立環境並增加約 5–6 GB。
+  0) 保留目前設定
+EOF
+  read -r -p "請選擇 [0-2]：" choice
+  case "${choice}" in
+    1) set_env_value "${MODEL_ENV}" QWEN3_TTS_INSTALL 0; ok "不建置 Qwen3 TTS 選用環境" ;;
+    2) set_env_value "${MODEL_ENV}" QWEN3_TTS_INSTALL 1; ok "將額外建置獨立 Qwen3 TTS 環境" ;;
+    0|"") return 0 ;;
+    *) warn "無效選項。"; return 1 ;;
+  esac
+}
+
 configure_runtime() {
   ensure_config_files
   local timesteps memory idle align_idle engine
@@ -944,7 +967,10 @@ build_frontend_backend() {
   else
     confirm "是否開始建置 SlideAI 前後端 Docker 映像？" yes || { skip "Docker 映像建置"; return 0; }
   fi
-  compose build
+  if ! compose build; then
+    warn "Docker 映像建置失敗；不會嘗試啟動不存在或過期的映像。"
+    return 1
+  fi
   ok "Docker 前後端映像建置完成"
   if confirm "是否立即啟動並驗證前後端？" yes; then
     if (( gpu_runtime == 0 )); then
@@ -989,6 +1015,7 @@ build_frontend_backend() {
 
 build_wizard() {
   is_interactive || die "建制精靈需要互動式終端。"
+  local frontend_backend_ready=1
   ensure_config_files
   ensure_secret_key
   line
@@ -1003,9 +1030,13 @@ build_wizard() {
 
   say "步驟 1/6：選擇 TTS 執行方式"
   configure_tts_engine || warn "沿用目前 TTS 執行方式。"
+  configure_optional_qwen_tts || warn "沿用目前 Qwen3 TTS 選用設定。"
 
   line; say "步驟 2/6：前後端與 Docker"
-  build_frontend_backend || warn "前後端環境尚未完成，繼續檢查其他項目。"
+  if ! build_frontend_backend; then
+    frontend_backend_ready=0
+    warn "前後端環境尚未完成；仍可設定模型與 API，但本次不會嘗試啟動。"
+  fi
 
   line; say "步驟 3/6：TTS 模型"
   model_wizard "VoxCPM2 TTS" VOXTTS_MODEL_HOST_PATH VOXCPM2_SOURCE "./models/tts/VoxCPM2" 0 || warn "TTS 尚未完成。"
@@ -1015,7 +1046,8 @@ build_wizard() {
 
   line; say "步驟 5/6：強制對齊"
   model_wizard "Qwen3 ForcedAligner" QWEN3_ALIGNER_MODEL_HOST_PATH QWEN3_ALIGNER_SOURCE "./models/alignment/Qwen3-ForcedAligner-0.6B" 0 || warn "強制對齊尚未完成。"
-  if confirm "是否也設定選用的 Qwen3 TTS？" no; then
+  load_model_settings
+  if [[ "${QWEN3_TTS_INSTALL:-0}" == "1" ]]; then
     model_wizard "Qwen3 TTS（選用）" QWEN3_TTS_MODEL_HOST_PATH QWEN3_TTS_SOURCE "./models/tts/Qwen3-TTS-12Hz-1.7B-Base" 1 || true
   fi
 
@@ -1025,7 +1057,9 @@ build_wizard() {
   line
   say "建制精靈完成。以下為目前狀態："
   status_report
-  if confirm "是否現在啟動 SlideAI？" yes; then
+  if (( frontend_backend_ready == 0 )); then
+    warn "Docker 映像尚未建置成功；請修正錯誤後再次執行『6 建制』。"
+  elif confirm "是否現在啟動 SlideAI？" yes; then
     start_services
   fi
 }

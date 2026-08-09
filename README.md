@@ -40,6 +40,9 @@ chmod +x slideai.sh
 一般部署不會安裝 Nano-vLLM。只有使用者在精靈中明確確認後，Docker build
 才會加入該加速環境。之後可由 `5 設定` 切換；切換 Docker 模式後需重新建置。
 
+Qwen3 TTS 也是選用備援。它與 Qwen3 ASR 鎖定不同的 Transformers 版本，
+因此選用時會建立獨立環境；預設 VoxCPM2 工作流不會下載這套環境與模型。
+
 ## WebUI 使用
 
 1. 上傳 PDF，選擇 AI 生成講稿或自行填寫逐頁講稿。

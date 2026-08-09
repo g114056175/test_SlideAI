@@ -13,6 +13,7 @@ services:
       dockerfile: docker/backend/Dockerfile
       args:
         INSTALL_VOXCPM_NANO: ${VOXTTS_INSTALL_NANO:-0}
+        INSTALL_QWEN_TTS: ${QWEN3_TTS_INSTALL:-0}
     gpus: all
     restart: unless-stopped
     logging: *default-logging
@@ -35,7 +36,7 @@ services:
       VOXTTS_ENGINE: ${VOXTTS_ENGINE:-original}
       VOXTTS_NANO_WORKER_PATH: /app/backend/app/workers/nano_voxcpm_worker.py
       VOXTTS_RUNTIME_PYTHON: ${VOXTTS_RUNTIME_PYTHON_CONTAINER:-/opt/slideai/voxcpm/bin/python}
-      QWEN3_TTS_RUNTIME_PYTHON: /opt/slideai/qwen-speech/bin/python
+      QWEN3_TTS_RUNTIME_PYTHON: /opt/slideai/qwen-tts/bin/python
       QWEN3_ASR_RUNTIME_PYTHON: /opt/slideai/qwen-speech/bin/python
       VOXTTS_NANO_TIMESTEPS: ${VOXTTS_NANO_TIMESTEPS:-12}
       VOXTTS_NANO_GPU_MEMORY_UTILIZATION: ${VOXTTS_NANO_GPU_MEMORY_UTILIZATION:-0.50}
