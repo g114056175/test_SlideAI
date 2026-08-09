@@ -10,6 +10,8 @@ ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build
 
 FROM nginx:1.27-alpine
+ARG SLIDEAI_SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision="${SLIDEAI_SOURCE_REVISION}"
 COPY docker/frontend/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /workspace/frontend/dist /usr/share/nginx/html
 EXPOSE 80

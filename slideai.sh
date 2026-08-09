@@ -160,7 +160,44 @@ load_hf_settings() {
 
 compose() {
   local args=(compose --env-file "${MODEL_ENV}" -f "${COMPOSE_FILE}")
-  "${DOCKER[@]}" "${args[@]}" "$@"
+  local frontend_port="${FRONTEND_PORT:-5174}"
+  local backend_port="${BACKEND_PORT:-8002}"
+  local source_revision="${SLIDEAI_SOURCE_REVISION:-$(source_revision)}"
+  # sudo normally removes caller environment variables.  Pass the runtime
+  # ports explicitly or Compose silently falls back to 5174/8002 while the
+  # launcher health-checks a different pair.
+  if [[ "${DOCKER[0]}" == "sudo" ]]; then
+    sudo env \
+      FRONTEND_PORT="${frontend_port}" \
+      BACKEND_PORT="${backend_port}" \
+      SLIDEAI_SOURCE_REVISION="${source_revision}" \
+      docker "${args[@]}" "$@"
+  else
+    env \
+      FRONTEND_PORT="${frontend_port}" \
+      BACKEND_PORT="${backend_port}" \
+      SLIDEAI_SOURCE_REVISION="${source_revision}" \
+      "${DOCKER[@]}" "${args[@]}" "$@"
+  fi
+}
+
+source_revision() {
+  git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || printf 'unknown'
+}
+
+image_revision() {
+  "${DOCKER[@]}" image inspect \
+    --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+    "$1" 2>/dev/null || true
+}
+
+docker_images_current() {
+  local expected backend_revision frontend_revision
+  expected="$(source_revision)"
+  [[ "${expected}" != "unknown" ]] || return 1
+  backend_revision="$(image_revision slideai-backend)"
+  frontend_revision="$(image_revision slideai-frontend)"
+  [[ "${backend_revision}" == "${expected}" && "${frontend_revision}" == "${expected}" ]]
 }
 
 docker_access() {
@@ -431,8 +468,12 @@ start_docker_services() {
   docker_access || die "Docker daemon 或 Compose 無法使用；請先執行建制。"
   nvidia_runtime_ready || die "Docker 尚未備妥 NVIDIA Container Runtime。"
   select_runtime_ports docker
-  if ! "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
-    info "首次啟動需建立 Docker 映像……"
+  if ! docker_images_current; then
+    if "${DOCKER[@]}" image inspect slideai-backend slideai-frontend >/dev/null 2>&1; then
+      info "程式碼已更新，正在重建 Docker 映像……"
+    else
+      info "首次啟動需建立 Docker 映像……"
+    fi
     if ! compose build; then
       die "Docker 映像建置失敗；請修正上方錯誤後再重試。"
     fi

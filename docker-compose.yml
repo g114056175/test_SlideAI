@@ -14,6 +14,7 @@ services:
       args:
         INSTALL_VOXCPM_NANO: ${VOXTTS_INSTALL_NANO:-0}
         INSTALL_QWEN_TTS: ${QWEN3_TTS_INSTALL:-0}
+        SLIDEAI_SOURCE_REVISION: ${SLIDEAI_SOURCE_REVISION:-unknown}
     gpus: all
     restart: unless-stopped
     logging: *default-logging
@@ -65,6 +66,7 @@ services:
       dockerfile: docker/frontend/Dockerfile
       args:
         VITE_API_BASE_URL: /api
+        SLIDEAI_SOURCE_REVISION: ${SLIDEAI_SOURCE_REVISION:-unknown}
     restart: unless-stopped
     logging: *default-logging
     depends_on:

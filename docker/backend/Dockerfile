@@ -59,6 +59,12 @@ RUN python3.12 -m venv /opt/slideai/backend \
 COPY backend /app/backend
 RUN mkdir -p /app/data/database /app/data/video_runs /models
 
+# Keep the revision marker after the expensive dependency layer so a source
+# update reuses the CUDA/Python environments and only rebuilds the small app
+# layer.
+ARG SLIDEAI_SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision="${SLIDEAI_SOURCE_REVISION}"
+
 ENV PATH=/opt/slideai/backend/bin:$PATH \
     VOXTTS_NANO_WORKER_PATH=/app/backend/app/workers/nano_voxcpm_worker.py \
     VOXTTS_RUNTIME_PYTHON=/opt/slideai/voxcpm/bin/python \
