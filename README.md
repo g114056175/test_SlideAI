@@ -70,10 +70,14 @@ Nano-vLLM 預設可使用 `VOXTTS_NANO_GPU_MEMORY_UTILIZATION=0.50`；16GB VRAM 
 [docs/agent-job.example.json](docs/agent-job.example.json)，完整格式、輪詢與輸出說明見
 [deploy/README.md](deploy/README.md)。
 
-<details>
-<summary><strong>詳細說明：架構、設計取捨與開發紀錄</strong></summary>
+## 詳細說明：架構、設計取捨與開發紀錄
 
-> 本區預設收起。一般使用者只需閱讀前面的快速開始；需要理解程式、替換模型或檢視開發成果時，再展開個別章節。
+<details>
+<summary><strong>展開／收合詳細技術文件</strong></summary>
+
+> 本節由 Codex（GPT-5.6 Sol）依據專案原始碼、實際測試結果、Git 開發紀錄與開發期間的對話內容協助整理，並非人工逐項撰寫及校訂。內容可能存在描述簡化、遺漏或與最新程式狀態不同步之處；涉及部署、安全性與效能決策時，仍應以目前原始碼、環境設定及實機測試結果為準。
+
+本區預設收起。一般使用者只需閱讀前面的快速開始；需要理解程式、替換模型或檢視開發成果時，再展開個別章節。
 
 <details>
 <summary><strong>1. 系統架構與完整處理流程</strong></summary>
