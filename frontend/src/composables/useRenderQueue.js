@@ -76,7 +76,6 @@ export function useRenderQueue({
 
   const createAudioFromTtsPreview = async (text, slideIdx = selectedSlideIndex.value) => {
     ensureRenderNotStopped()
-    const token = localStorage.getItem('token')
     const formData = new FormData()
     formData.append('text', String(text || '').trim())
     formData.append('voice', globalSettings.value.tts.voice)
@@ -92,7 +91,6 @@ export function useRenderQueue({
       : getApiEndpoint('/api/video-abstract/tts-preview')
     const res = await fetch(endpoint, {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
       body: formData,
       signal: currentRenderAbortController.signal,
     })
@@ -120,7 +118,6 @@ export function useRenderQueue({
 
   const alignSubtitleForAudio = async (audioFile, text, slideIdx = selectedSlideIndex.value) => {
     ensureRenderNotStopped()
-    const token = localStorage.getItem('token')
     const formData = new FormData()
     if (audioFile instanceof Blob) formData.append('audio_file', audioFile)
     formData.append('text', String(text || '').trim())
@@ -134,7 +131,6 @@ export function useRenderQueue({
       : getApiEndpoint('/api/video-abstract/subtitle-align')
     const res = await fetch(endpoint, {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
       body: formData,
       signal: currentRenderAbortController.signal,
     })
@@ -165,7 +161,6 @@ export function useRenderQueue({
       imgBlob = await imgResp.blob()
     }
 
-    const token = localStorage.getItem('token')
     const formData = new FormData()
     if (audioFile instanceof Blob) formData.append('audio_file', audioFile)
     if (imgBlob) formData.append('slide_image', imgBlob, `slide_${slideIdx + 1}.png`)
@@ -201,7 +196,6 @@ export function useRenderQueue({
     currentRenderAbortController = new AbortController()
     const res = await fetch(getApiEndpoint('/api/video-abstract/render-subtitle-ass-video'), {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
       body: formData,
       signal: currentRenderAbortController.signal,
     })
@@ -600,10 +594,8 @@ export function useRenderQueue({
           formData.append('videos', new File([blob], `page_${idx + 1}.mp4`, { type: 'video/mp4' }))
         }
       }
-      const token = localStorage.getItem('token')
       const res = await fetch(mergeUrl, {
         method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData,
       })
       if (!res.ok) {

@@ -58,9 +58,9 @@
 
 ---
 
-## Lab 測試環境（`/video-abstract-lab`）
+## 主工作區（`/` 與 `/video-abstract-lab`）
 
-> Lab 路由為免登入測試入口，不影響正式路由。
+> 兩個網址等效，皆為可信任內網、免登入的正式工作區。
 
 - **Mock 模式**（`VIDEO_ABSTRACT_MOCK_MODE`）：不消耗 LLM/TTS 額度
 - **LOCAL_ONLY 模式**（`VIDEO_ABSTRACT_LOCAL_ONLY`）：禁止外部 API 呼叫

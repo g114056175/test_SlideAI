@@ -5,7 +5,6 @@
         <Sidebar
           :key="sidebarKey"
           ref="sidebarRef"
-          :user-email="userEmail"
           :active-project-id="activeProjectId"
           :active-run-id="activeRunId"
           @toggle="toggleSidebar"
@@ -44,7 +43,6 @@
 
 <script setup>
 import { computed, ref, onMounted, onBeforeUnmount } from 'vue'
-import { apiRequest, API_ENDPOINTS } from '../config/api.js'
 import Sidebar from './Sidebar.vue'
 
 const props = defineProps({
@@ -58,7 +56,6 @@ const OVERLAY_BREAKPOINT = 1100
 const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1440)
 const isOverlaySidebar = computed(() => viewportWidth.value < OVERLAY_BREAKPOINT)
 const collapsed = ref(true)
-const userEmail = ref('')
 const sidebarKey = ref(0) // increment to force-remount Sidebar
 
 let lastOverlayMode = isOverlaySidebar.value
@@ -99,22 +96,12 @@ const handleSelectProject = (project) => {
   if (isOverlaySidebar.value) closeSidebar()
 }
 
-const fetchUser = async () => {
-  try {
-    const me = await apiRequest(API_ENDPOINTS.ME)
-    userEmail.value = me.email || ''
-  } catch (e) {
-    // silently ignore; sidebar will show empty email
-  }
-}
-
 const sidebarRef = ref(null)
 
 onMounted(() => {
   checkBreakpoint()
   if (!props.disableSidebar) {
     window.addEventListener('resize', checkBreakpoint)
-    fetchUser()
   }
 })
 

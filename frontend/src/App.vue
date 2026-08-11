@@ -1,14 +1,5 @@
-<script setup>
-import { defineAsyncComponent } from 'vue'
-
-const DebugPanel = import.meta.env.DEV
-  ? defineAsyncComponent(() => import('./components/DebugPanel.vue'))
-  : null
-</script>
-
 <template>
   <router-view />
-  <DebugPanel v-if="DebugPanel" />
 </template>
 
 <style scoped>

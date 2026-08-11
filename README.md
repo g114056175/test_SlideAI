@@ -18,6 +18,8 @@ chmod +x slideai.sh
 
 第一次請選 `6 建制`，依精靈選擇 Docker、模型來源／本機路徑及選用的 LLM。
 完成後選 `1 啟動`；終端會顯示本次實際使用的 WebUI 與 API port。
+預設 WebUI 為 `http://127.0.0.1:5174/`；`/` 與
+`/video-abstract-lab` 是同一個免登入主工作區。
 
 ```text
 1) 啟動    2) 關閉    3) 重新啟動
@@ -192,7 +194,7 @@ ASS 被選為主流程，是因為它能在 1920×1080 輸出下穩定控制字�
 </details>
 
 <details>
-<summary><strong>8. Artifact 資料結構、鎖與不用 SQL 的理由</strong></summary>
+<summary><strong>8. Artifact 資料結構、鎖與移除 SQL 的理由</strong></summary>
 
 ```text
 data/video_runs/<run-id>/
@@ -203,9 +205,9 @@ data/video_runs/<run-id>/
 └── merged/                 # 合併 MP4、SRT、下載 bundle
 ```
 
-目前是單機／研究室工具，artifact-first 比 SQL 更容易直接檢查、備份、回檔與續跑；每個 run 自帶完整上下文，搬移時不需要重建資料庫關聯。manifest 更新使用程序鎖與原子替換，避免縮圖背景執行緒、批次 worker 和 UI 同時寫入而遺失欄位。
+目前是單機／研究室工具，artifact-first 比 SQL 更容易直接檢查、備份、回檔與續跑；每個 run 自帶完整上下文，搬移時不需要重建資料庫關聯。manifest 更新使用程序鎖與原子替換，避免縮圖背景執行緒、批次 worker 和 UI 同時寫入而遺失欄位。舊版帳號、額度、管理員、SQLAlchemy／SQLite 與密碼雜湊層已從正式後端移除；舊前端元件僅保留作為設計紀錄，不掛入正式路由。
 
-`data/database/` 的 SQLite 主要是舊版帳號與應用相容資料，不是影片工作流的唯一真實來源。如果未來要支援公開註冊、多租戶隔離、跨機 worker、計費或數十萬個專案查詢，才應把 metadata 與排程移到 PostgreSQL／Redis；大型音訊與影片仍應留在檔案或 object storage。
+若未來要重新支援公開註冊、多租戶隔離、跨機 worker、計費或數十萬個專案查詢，應另行設計 PostgreSQL／Redis metadata 層與應用層授權；大型音訊與影片仍應留在檔案或 object storage，而不是恢復舊資料表即直接對外使用。
 
 </details>
 
@@ -239,7 +241,7 @@ Cloudflare 能降低掃描與未授權流量，但不取代應用層登入、權
 - 匯出 YouTube 章節文字，但維持人工上傳，避免帳號與誤發布風險。
 - 以固定模板、嚴格 JSON schema 建立 HTML 動態簡報模組，並讓講稿帶觸發點。
 - PDF OCR 聚焦／Zoom 僅在高可信頁面啟用；若無法穩定辨認同類物件，寧可不加效果。
-- 完成手機版工作區、SQLAlchemy 新 API 與 Python 3.13 前的 passlib 替代。
+- 完成手機版工作區；若未來恢復多租戶，重新設計獨立的身分驗證與資料庫層。
 
 部署檢查可執行 `scripts/portability_check.sh` 與 `scripts/smoke_test.sh`；`--full` 會實際載入模型並生成影片。
 

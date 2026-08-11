@@ -22,7 +22,6 @@ services:
       - path: backend/.env
         required: false
     environment:
-      DATABASE_URL: sqlite:////app/data/database/slideai.sqlite3
       SLIDEAI_VIDEO_RUNS_DIR: /app/data/video_runs
       FRONTEND_URL: http://localhost:${FRONTEND_PORT:-5174}
       VIDEO_ABSTRACT_LOCAL_ONLY: ${VIDEO_ABSTRACT_LOCAL_ONLY:-true}
@@ -74,18 +73,3 @@ services:
         condition: service_healthy
     ports:
       - "${FRONTEND_PORT:-5174}:80"
-
-  postgres:
-    image: postgres:16
-    profiles: ["postgres"]
-    restart: unless-stopped
-    logging: *default-logging
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-slideai}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
-      POSTGRES_DB: ${POSTGRES_DB:-slideai}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-volumes:
-  postgres_data:

@@ -36,25 +36,7 @@ const CACHE_DURATION = 5 * 60 * 1000; // 5分鐘
 
 // API 端點
 export const API_ENDPOINTS = {
-  LOGIN: "/api/login",
-  REGISTER: "/api/register",
-  ME: "/api/me",
-  FORGOT_PASSWORD: "/api/forgot-password",
-  RESET_PASSWORD: "/api/reset-password",
-  // USAGE_STATUS removed: usage-statistics UI/functionality removed from frontend
   VIDEO_ABSTRACT: "/api/video-abstract",
-  PROJECTS: "/api/projects",
-  ADMIN_USER_COUNT: "/api/admin/user-count",
-  ADMIN_USER_TOTAL: "/api/admin/user-total",
-  ADMIN_USER_LIST: "/api/admin/user-list",
-  ADMIN_USAGE_STATISTICS: "/api/admin/usage-statistics",
-  ADMIN_DAILY_USAGE_SUMMARY: "/api/admin/daily-usage-summary",
-  ADMIN_CLEANUP_FILES: "/api/admin/cleanup-files",
-
-  ADMIN_DATABASE_STATS: "/api/admin/database-stats",
-  ADMIN_RECENT_UPLOADS: "/api/admin/recent-uploads",
-  ADMIN_USER_ACTIVITY: "/api/admin/user-activity",
-  ADMIN_VERIFY_UPLOAD: "/api/admin/verify-upload",
 };
 
 const normalizeEndpoint = (endpoint) => {
@@ -86,11 +68,10 @@ const isCacheValid = (cacheEntry) => {
 // 通用的 fetch 函數
 export const apiRequest = async (endpoint, options = {}) => {
   const url = getApiEndpoint(endpoint);
-  const token = localStorage.getItem("token");
 
   // 對於 GET 請求，檢查快取
   if (options.method === "GET" || !options.method) {
-    const cacheKey = `${url}-${token || "no-token"}`;
+    const cacheKey = url;
     const cachedResponse = requestCache.get(cacheKey);
 
     if (isCacheValid(cachedResponse)) {
@@ -102,11 +83,6 @@ export const apiRequest = async (endpoint, options = {}) => {
   const defaultHeaders = {
     "Content-Type": "application/json",
   };
-
-  // 只有在沒有明確提供 Authorization header 時才使用 localStorage 的 token
-  if (!options.headers?.Authorization && token) {
-    defaultHeaders.Authorization = `Bearer ${token}`;
-  }
 
   const config = {
     ...options,
@@ -146,7 +122,7 @@ export const apiRequest = async (endpoint, options = {}) => {
 
     // 對於 GET 請求，存入快取
     if (options.method === "GET" || !options.method) {
-      const cacheKey = `${url}-${token || "no-token"}`;
+      const cacheKey = url;
       requestCache.set(cacheKey, {
         data,
         timestamp: Date.now(),
@@ -181,7 +157,7 @@ export const clearExpiredCache = () => {
 /**
  * Remove all cache entries whose key starts with the given endpoint path.
  * Call this before re-fetching a resource that was just mutated on the server.
- * Example: clearEndpointCache('/api/projects')
+ * Example: clearEndpointCache('/api/video-runs')
  */
 export const clearEndpointCache = (endpoint) => {
   const prefix = getApiEndpoint(endpoint)

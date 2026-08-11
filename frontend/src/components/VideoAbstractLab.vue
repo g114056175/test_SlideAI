@@ -461,10 +461,8 @@ const scheduleQwenTtsWarmup = (delay = 250) => {
   qwenTtsWarmupTimer = setTimeout(async () => {
     qwenTtsWarmupTimer = null
     try {
-      const token = localStorage.getItem('token')
       await fetch(getApiEndpoint('/api/video-abstract/tts-warmup'), {
         method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
       })
     } catch (e) {
       console.warn('[Qwen3 TTS] warmup failed:', e)
@@ -1642,8 +1640,7 @@ const createSlideModels = (texts) => texts.map((text, idx) => ({
 const fetchThumbnail = async (idx, currentPdfId) => {
   try {
     const endpoint = getApiEndpoint('/api/video-abstract/thumbnail') + `?pdf_id=${encodeURIComponent(currentPdfId)}&page=${idx + 1}`
-    const token = localStorage.getItem('token')
-    const res = await fetch(endpoint, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+    const res = await fetch(endpoint)
     if (!res.ok) return
     const blob = await res.blob()
     const objectUrl = URL.createObjectURL(blob)
@@ -1948,10 +1945,8 @@ const handleUpload = async () => {
     const shouldSkipLlm = subtitleSource.value === 'none' || subtitleSource.value === 'user_input'
     formData.append('skip_llm', shouldSkipLlm ? 'true' : 'false')
 
-    const token = localStorage.getItem('token')
     const res = await fetch(getApiEndpoint(API_ENDPOINTS.VIDEO_ABSTRACT), {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
       body: formData,
     })
     const data = await res.json().catch(() => ({}))
@@ -2207,7 +2202,6 @@ const generateSubtitleAlignment = async () => {
   subtitleDemoPlaying.value = false
 
   try {
-    const token = localStorage.getItem('token')
     const formData = new FormData()
     formData.append('audio_file', subtitleAudioFile.value)
 
@@ -2220,7 +2214,6 @@ const generateSubtitleAlignment = async () => {
         asrForm.append('reference_audio', subtitleAudioFile.value)
         const asrRes = await fetch(getApiEndpoint('/api/video-abstract/reference-asr'), {
           method: 'POST',
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
           body: asrForm,
         })
         if (asrRes.ok) {
@@ -2243,7 +2236,6 @@ const generateSubtitleAlignment = async () => {
 
     const res = await fetch(getApiEndpoint('/api/video-abstract/subtitle-align'), {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
       body: formData,
     })
     const data = await res.json().catch(() => ({}))
@@ -2277,7 +2269,6 @@ const generateTtsPreview = async () => {
   }
 
   try {
-    const token = localStorage.getItem('token')
     const formData = new FormData()
     formData.append('text', ttsPreviewText.value.trim())
     formData.append('voice', globalSettings.value.tts.voice)
@@ -2292,7 +2283,6 @@ const generateTtsPreview = async () => {
       getApiEndpoint('/api/video-abstract/tts-preview'),
       {
         method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : {},
         body: formData,
       }
     )
@@ -2318,12 +2308,10 @@ const fillReferenceTextWithLocalAsr = async () => {
   asrFilling.value = true
   ttsError.value = ''
   try {
-    const token = localStorage.getItem('token')
     const formData = new FormData()
     formData.append('reference_audio', cloneAudioFile.value)
     const res = await fetch(getApiEndpoint('/api/video-abstract/reference-asr'), {
       method: 'POST',
-      headers: token ? { Authorization: `Bearer ${token}` } : {},
       body: formData,
     })
     const data = await res.json().catch(() => ({}))

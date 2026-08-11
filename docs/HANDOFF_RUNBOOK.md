@@ -7,7 +7,7 @@ Create a source-only copy:
 ```
 
 The default excludes model weights, virtual environments, Node dependencies,
-generated videos and the local database. To copy the four known checkpoint
+generated videos. To copy the four known checkpoint
 directories into the standardized slots, add `--with-models`; model Python
 environments are still excluded.
 

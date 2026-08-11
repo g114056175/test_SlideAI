@@ -66,7 +66,6 @@ RSYNC_EXCLUDES=(
   "--exclude=backend/node_modules"
   "--exclude=frontend/node_modules"
   "--exclude=frontend/dist"
-  "--exclude=data/database/*"
   "--exclude=models/**"
 )
 
@@ -77,12 +76,10 @@ fi
 mkdir -p "${TARGET_SLIDEAI}"
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "${PROJECT_ROOT}/" "${TARGET_SLIDEAI}/"
 mkdir -p \
-  "${TARGET_SLIDEAI}/data/database" \
   "${TARGET_SLIDEAI}/data/video_runs" \
   "${TARGET_SLIDEAI}/models/tts" \
   "${TARGET_SLIDEAI}/models/asr" \
   "${TARGET_SLIDEAI}/models/alignment"
-touch "${TARGET_SLIDEAI}/data/database/.gitkeep"
 touch "${TARGET_SLIDEAI}/data/video_runs/.gitkeep"
 
 if [[ "${INCLUDE_MODELS}" == "1" ]]; then

@@ -67,29 +67,21 @@
       </div>
     </div>
 
-    <!-- Footer -->
-    <div class="sidebar-footer">
-      <div class="footer-email" :title="userEmail">{{ userEmail }}</div>
-      <button class="btn-logout" @click="logout">Logout</button>
-    </div>
   </aside>
 </template>
 
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
 import { apiRequest, getApiEndpoint, clearEndpointCache } from '../config/api.js'
 import { emitter } from '../config/events.js'
 
 const props = defineProps({
-  userEmail: { type: String, default: '' },
   activeProjectId: { type: Number, default: null },
   activeRunId: { type: String, default: '' },
 })
 
 const emit = defineEmits(['toggle', 'new-project', 'select-project', 'project-deleted'])
 
-const router = useRouter()
 const videoRuns = ref([])
 const loadingRuns = ref(false)
 const editingRunId = ref('')
@@ -123,10 +115,8 @@ const deleteVideoRun = async (run) => {
   )
   if (!confirmed) return
   try {
-    const token = localStorage.getItem('token')
     const res = await fetch(getApiEndpoint(`/api/video-runs/${encodeURIComponent(run.run_id)}`), {
       method: 'DELETE',
-      headers: token ? { Authorization: 'Bearer ' + token } : {},
     })
     if (res.ok) {
       videoRuns.value = videoRuns.value.filter((item) => item.run_id !== run.run_id)
@@ -155,12 +145,10 @@ const saveRunName = async (run) => {
   const nextName = String(editingRunName.value || '').trim()
   if (!nextName) return
   try {
-    const token = localStorage.getItem('token')
     const res = await fetch(getApiEndpoint(`/api/video-runs/${encodeURIComponent(run.run_id)}`), {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
-        ...(token ? { Authorization: 'Bearer ' + token } : {}),
       },
       body: JSON.stringify({ display_name: nextName }),
     })
@@ -175,11 +163,6 @@ const saveRunName = async (run) => {
   } catch (e) {
     // Keep edit mode so the user can retry.
   }
-}
-
-const logout = () => {
-  localStorage.removeItem('token')
-  router.push('/login')
 }
 
 // Format ISO date string as a readable relative/short form

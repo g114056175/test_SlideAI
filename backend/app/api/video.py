@@ -13,21 +13,13 @@ import threading
 import time
 import re
 from pathlib import Path
-from fastapi import APIRouter, UploadFile, File, Form, Request, Query, HTTPException, Response, Depends
+from fastapi import APIRouter, UploadFile, File, Form, Request, Query, HTTPException, Response
 from fastapi.responses import FileResponse, JSONResponse
 import io
 from pdf2image import convert_from_path
 from pydantic import BaseModel, Field
 from PIL import Image, UnidentifiedImageError
 import urllib.parse
-from sqlalchemy.orm import Session
-from backend.app.models import User
-from backend.app.deps import (
-    get_db, get_current_user, check_daily_usage_limit, create_file_record,
-    record_usage, create_project_record, update_project_video_url, delete_project,
-    MAX_FILE_SIZE, FILE_RETENTION_DAYS, DAILY_USAGE_LIMIT,
-)
-from backend.app.models import Project
 from typing import Optional, List
 import pypdf as PyPDF2
 from backend.app.services.speech_providers import (
@@ -50,7 +42,6 @@ from backend.app.api.video_helpers import (
     pregenerate_thumbnails_safe as _pregenerate_thumbnails,
     split_user_script_to_pages as _split_user_script_to_pages,
     to_traditional_chinese_for_display as _to_traditional_chinese_for_display,
-    try_get_current_user_from_request as _try_get_current_user_from_request,
 )
 logger = logging.getLogger("video_abstract")
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +51,7 @@ _ALIGNMENT_CACHE: dict[str, dict] = {}
 _ALIGNMENT_CACHE_TTL_SEC = 900 # 15 minutes
 MAX_CACHE_ENTRIES = 3
 _PRESET_VOICE_DIR = Path(__file__).resolve().parents[1] / "static" / "ref_voices"
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", str(50 * 1024 * 1024)))
 
 
 def _load_preset_reference_voice(voice_key: str) -> tuple[bytes, str, str] | None:
@@ -150,7 +142,6 @@ def _use_nano_voxcpm_tts() -> bool:
 async def video_abstract_api(
     request: Request,
     file: UploadFile = File(None),
-    db: Session = Depends(get_db),
 ):
     """
     1. 若有 file，回傳 AI 文字陣列（JSON，不產生影片）
@@ -159,63 +150,11 @@ async def video_abstract_api(
 
     mock_mode = _is_mock_mode()
     local_only_mode = _is_local_only_mode()
-    current_user = _try_get_current_user_from_request(request, db)
-
-    if not mock_mode and not local_only_mode and current_user is None:
-        raise HTTPException(status_code=401, detail="Not authenticated")
 
     if file:
-        # If a video file is uploaded, handle as video-abstract video upload
+        # The local-first application accepts PDF presentations only.
         if file.content_type and file.content_type.startswith("video/"):
-            # usage limit
-            if not check_daily_usage_limit(current_user, db):
-                raise HTTPException(status_code=429, detail=f"今日使用次數已達上限({DAILY_USAGE_LIMIT}次)，請明天再試")
-
-            # check file size
-            file.file.seek(0, os.SEEK_END)
-            size = file.file.tell()
-            file.file.seek(0)
-            if size > MAX_FILE_SIZE:
-                raise HTTPException(status_code=400, detail=f"檔案過大，請上傳 {MAX_FILE_SIZE // 1024 // 1024}MB 以下的影片")
-
-            # save video file
-            files_dir = os.path.join(os.getcwd(), "user_files")
-            os.makedirs(files_dir, exist_ok=True)
-            file_extension = os.path.splitext(file.filename)[1]
-            unique_filename = f"{uuid.uuid4()}{file_extension}"
-            file_path = os.path.join(files_dir, unique_filename)
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-
-            # create file record
-            file_record = create_file_record(
-                user=current_user,
-                file_name=file.filename,
-                file_path=file_path,
-                file_type="video_abstract",
-                file_size=size,
-                db=db
-            )
-
-            try:
-                # placeholder AI analysis
-                result = f"這是影片 {file.filename} 的 AI 摘要。影片內容分析完成，包含關鍵場景、重要對話和主要情節。"
-                file_record.analysis_result = result
-                file_record.status = 'completed'
-                db.commit()
-                record_usage(current_user, "video_abstract", db)
-                return JSONResponse({
-                    "result": result,
-                    "file_id": file_record.id,
-                    "expires_at": file_record.expires_at.isoformat(),
-                    "retention_days": FILE_RETENTION_DAYS
-                })
-            except Exception as e:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                db.delete(file_record)
-                db.commit()
-                raise HTTPException(status_code=500, detail=f'處理失敗: {str(e)}')
+            raise HTTPException(status_code=415, detail="目前僅支援 PDF 簡報")
 
         # Reserve the persistent run input path up front so the run copy is the
         # only canonical project PDF.
@@ -315,26 +254,8 @@ async def video_abstract_api(
             shutil.rmtree(run_store.run_dir(reserved_run_id), ignore_errors=True)
             raise
 
-        # Create a project record so the job is tracked from the start.
+        # Filesystem manifests are the sole project record.
         project_id = None
-        project = None
-        try:
-            if current_user is not None:
-                project = create_project_record(
-                    user=current_user,
-                    project_name=project_name,
-                    pdf_path=pdf_path,
-                    script_json=None,
-                    db=db,
-                    pdf_id=pdf_id,
-                )
-                project_id = project.id
-                logger.info(f"[UPLOAD] Created project record id={project.id} name={project_name}")
-            elif mock_mode:
-                logger.info("[UPLOAD][MOCK] No auth user, skip project record creation")
-        except Exception:
-            shutil.rmtree(run_store.run_dir(reserved_run_id), ignore_errors=True)
-            raise
 
         run_manifest = None
         run_id = None
@@ -375,12 +296,6 @@ async def video_abstract_api(
             ).start()
         except Exception as run_err:
             logger.error(f"[UPLOAD] Failed to create persistent video run: {run_err}", exc_info=True)
-            if project is not None:
-                try:
-                    db.delete(project)
-                    db.commit()
-                except Exception:
-                    db.rollback()
             shutil.rmtree(run_store.run_dir(reserved_run_id), ignore_errors=True)
             raise HTTPException(status_code=500, detail=f"建立專案資料失敗: {run_err}")
 
@@ -486,70 +401,6 @@ async def video_abstract_thumbnail(pdf_id: str = Query(...), page: int = Query(1
     except Exception as e:
         logger.error(f"[THUMBNAIL] Error rendering thumbnail: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error rendering thumbnail")
-
-
-# ---------------------------------------------------------------------------
-# Project history endpoints
-# ---------------------------------------------------------------------------
-
-@router.get("/api/projects")
-async def list_projects(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Return all non-deleted projects for the authenticated user, newest first.
-    """
-    projects = (
-        db.query(Project)
-        .filter(
-            Project.user_id == current_user.id,
-            Project.status != 'deleted',
-        )
-        .order_by(Project.created_at.desc())
-        .all()
-    )
-    return JSONResponse([
-        {
-            "id":           p.id,
-            "project_name": p.project_name,
-            "pdf_id":       p.pdf_id,
-            "pdf_path":     p.pdf_path,
-            "video_url":    p.video_url,
-            "script_json":  p.script_json,
-            "status":       p.status,
-            "created_at":   p.created_at.isoformat() if p.created_at else None,
-        }
-        for p in projects
-    ])
-
-
-@router.delete("/api/projects/{project_id}")
-async def delete_project_endpoint(
-    project_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """
-    Soft-delete a project.  The video file is removed from disk; the database
-    row is kept with status='deleted' for audit purposes.
-    """
-    result = delete_project(
-        project_id=project_id,
-        user_id=current_user.id,
-        db=db,
-    )
-
-    if not result['found']:
-        raise HTTPException(status_code=404, detail="Project not found.")
-    if result['forbidden']:
-        raise HTTPException(status_code=403, detail="Not authorized to delete this project.")
-
-    logger.info(
-        f"[DELETE PROJECT] project_id={project_id} user_id={current_user.id} "
-        f"file_deleted={result['file_deleted']}"
-    )
-    return JSONResponse({"detail": "Project deleted.", "file_deleted": result['file_deleted']})
 
 
 # ── TTS 試聽 Preview Endpoint ──────────────────────────────────────────────

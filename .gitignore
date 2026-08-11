@@ -55,7 +55,8 @@ coverage/
 *.sln
 *.sw?
 
-# Local database
+# Local database artifacts are not used by the current artifact-first workflow,
+# but keep them out of Git if an experiment creates one.
 *.sqlite3
 *.db
 
@@ -73,8 +74,6 @@ frontend/.env*.local
 # SlideAI local persistent run artifacts
 data/video_runs/*
 !data/video_runs/.gitkeep
-data/database/*
-!data/database/.gitkeep
 deploy/models.env
 
 # Large model weights and optional external runtime environments

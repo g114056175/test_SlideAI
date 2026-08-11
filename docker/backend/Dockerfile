@@ -57,7 +57,7 @@ RUN python3.12 -m venv /opt/slideai/backend \
        fi
 
 COPY backend /app/backend
-RUN mkdir -p /app/data/database /app/data/video_runs /models
+RUN mkdir -p /app/data/video_runs /models
 
 # Keep the revision marker after the expensive dependency layer so a source
 # update reuses the CUDA/Python environments and only rebuilds the small app

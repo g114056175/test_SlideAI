@@ -60,21 +60,6 @@ ensure_config_files() {
   chmod 600 "${BACKEND_ENV}"
 }
 
-ensure_secret_key() {
-  ensure_config_files
-  local secret
-  secret="$(env_value "${BACKEND_ENV}" SECRET_KEY 2>/dev/null || true)"
-  if [[ -z "${secret}" || "${secret}" == "replace-with-a-long-random-value" ]]; then
-    if command -v openssl >/dev/null 2>&1; then
-      secret="$(openssl rand -hex 32)"
-    else
-      secret="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-    fi
-    set_env_value "${BACKEND_ENV}" SECRET_KEY "${secret}"
-    info "已產生本機 SECRET_KEY（內容不顯示）。"
-  fi
-}
-
 env_value() {
   local file="$1" key="$2" value
   [[ -f "${file}" ]] || return 1
@@ -331,8 +316,8 @@ announce_runtime_ports() {
   local label="$1" lan_ip
   lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   ok "${label}"
-  say "  WebUI：http://127.0.0.1:${FRONTEND_PORT}/video-abstract-lab"
-  [[ -n "${lan_ip}" ]] && say "  區網：http://${lan_ip}:${FRONTEND_PORT}/video-abstract-lab"
+  say "  WebUI：http://127.0.0.1:${FRONTEND_PORT}/"
+  [[ -n "${lan_ip}" ]] && say "  區網：http://${lan_ip}:${FRONTEND_PORT}/"
   say "  API：http://127.0.0.1:${BACKEND_PORT}/docs"
 }
 
@@ -384,7 +369,7 @@ prepare_basic_runtime() {
 }
 
 start_basic_services() {
-  ensure_secret_key
+  ensure_config_files
   prepare_basic_runtime
   load_model_settings
   select_runtime_ports basic
@@ -526,7 +511,7 @@ start_docker_services() {
 
 start_services() {
   require_launcher_commands || die "請先補齊啟動工具後重試。"
-  ensure_secret_key
+  ensure_config_files
   load_model_settings
   case "${SLIDEAI_DEPLOY_MODE:-docker}" in
     native) start_native_services ;;
@@ -1194,7 +1179,6 @@ build_wizard() {
   is_interactive || die "建制精靈需要互動式終端。"
   local frontend_backend_ready=1
   ensure_config_files
-  ensure_secret_key
   line
   say "SlideAI 首次建制精靈"
   say "每個階段都可以跳過；進行下載或安裝前會再次確認。"

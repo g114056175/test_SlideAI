@@ -5,14 +5,7 @@ import subprocess
 import tempfile
 import time
 import hashlib
-from typing import Optional
-
-from fastapi import Request
 from pdf2image import convert_from_path
-from sqlalchemy.orm import Session
-
-from backend.app.deps import decode_access_token
-from backend.app.models import User
 
 _OPENCC_S2T = None
 _OPENCC_S2T_IMPORT_FAILED = False
@@ -178,20 +171,3 @@ def is_mock_mode() -> bool:
 
 def is_local_only_mode() -> bool:
     return str(os.getenv("VIDEO_ABSTRACT_LOCAL_ONLY", "")).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def try_get_current_user_from_request(request: Request, db: Session) -> Optional[User]:
-    auth = request.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        return None
-    token = auth.split(" ", 1)[1].strip()
-    if not token:
-        return None
-    try:
-        payload = decode_access_token(token)
-        email = payload.get("sub")
-        if not email:
-            return None
-        return db.query(User).filter_by(email=email).first()
-    except Exception:
-        return None
