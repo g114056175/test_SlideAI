@@ -1,4 +1,5 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 from tqdm import tqdm
 import time
 import os
@@ -6,11 +7,11 @@ import asyncio
 import re
 import hashlib
 import base64
+import mimetypes
 import numpy as np
 import requests
 import logging
 import threading
-from PIL import Image
 from backend.app.services.utility.text import *
 import soundfile as sf
 
@@ -323,8 +324,7 @@ Content to rewrite:'''
 	# 🚀 Step A: 設定 Gemini 客戶端與並發控制
 	# ─────────────────────────────────────────────────────────────
 	model_name = (model_name_override or get_google_generative_model_name()).strip()
-	genai.configure(api_key=api_key)
-	model = genai.GenerativeModel(model_name)
+	client = genai.Client(api_key=api_key)
 	print(f"[GEMINI] Model: {model_name}")
 
 	# Semaphore: 最多同時 3 個並行請求，防止觸發 429 Rate Limit
@@ -353,7 +353,10 @@ Content to rewrite:'''
 					response = await loop.run_in_executor(
 						None,
 						lambda t=text: _with_llm_request_slot(
-							lambda: model.generate_content(f'{system_prompt} {t}')
+							lambda: client.models.generate_content(
+								model=model_name,
+								contents=f'{system_prompt} {t}',
+							)
 						)
 					)
 					generated_text = remove_markdown(response.text)
@@ -405,7 +408,10 @@ Content to rewrite:'''
 	# ─────────────────────────────────────────────────────────────
 	print(f"[GEMINI] 並行發送 {len(text_array)} 頁請求（Semaphore=3）...")
 	tasks = [_generate_one_page(idx, text) for idx, text in enumerate(text_array)]
-	raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+	try:
+		raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+	finally:
+		client.close()
 
 	# 檢查是否有任何頁面失敗
 	for result in raw_results:
@@ -601,8 +607,7 @@ async def generate_presentation_scripts_from_images(
 		raise ValueError("LLM api_key is empty")
 
 	model_name = (model_name_override or get_google_generative_fallback_model_name()).strip()
-	genai.configure(api_key=api_key)
-	model = genai.GenerativeModel(model_name)
+	client = genai.Client(api_key=api_key)
 	lang = str(language or "zh").lower()
 	is_en = lang.startswith("en")
 	if is_en:
@@ -622,25 +627,34 @@ async def generate_presentation_scripts_from_images(
 
 	loop = asyncio.get_event_loop()
 	results = []
-	for idx, img_path in enumerate(image_paths):
-		path = str(img_path or "").strip()
-		if not path or not os.path.isfile(path):
-			results.append("")
-			continue
-		def _call_one(p=path):
-			with Image.open(p) as img:
-				rsp = _with_llm_request_slot(
-					lambda: model.generate_content([prompt, img.convert("RGB")])
-				)
-				txt = remove_markdown(str(getattr(rsp, "text", "") or "").strip())
-				logger.info("[LLM][GeminiVision][%s][p%s] raw_len=%s preview=%r", model_name, idx + 1, len(txt), txt[:180])
-				return txt
-		try:
-			content = await loop.run_in_executor(None, _call_one)
-		except Exception as exc:
-			logger.error("[LLM][GeminiVision] page %s failed: %s", idx + 1, exc)
-			content = ""
-		results.append(content)
+	try:
+		for idx, img_path in enumerate(image_paths):
+			path = str(img_path or "").strip()
+			if not path or not os.path.isfile(path):
+				results.append("")
+				continue
+			def _call_one(p=path):
+				mime_type = mimetypes.guess_type(p)[0] or "image/png"
+				with open(p, "rb") as image_fp:
+					image_part = genai_types.Part.from_bytes(
+						data=image_fp.read(),
+						mime_type=mime_type,
+					)
+					rsp = _with_llm_request_slot(lambda: client.models.generate_content(
+						model=model_name,
+						contents=[prompt, image_part],
+					))
+					txt = remove_markdown(str(getattr(rsp, "text", "") or "").strip())
+					logger.info("[LLM][GeminiVision][%s][p%s] raw_len=%s preview=%r", model_name, idx + 1, len(txt), txt[:180])
+					return txt
+			try:
+				content = await loop.run_in_executor(None, _call_one)
+			except Exception as exc:
+				logger.error("[LLM][GeminiVision] page %s failed: %s", idx + 1, exc)
+				content = ""
+			results.append(content)
+	finally:
+		client.close()
 	return results
 
 

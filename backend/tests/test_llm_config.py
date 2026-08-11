@@ -77,6 +77,42 @@ def test_explicit_provider_prefers_its_own_key_over_legacy_key(monkeypatch):
     assert llm_api.get_llm_api_key() == "selected-openai-key"
 
 
+def test_google_provider_uses_new_genai_client(monkeypatch):
+    _clear_llm_env(monkeypatch)
+    captured = {"closed": False}
+
+    class DummyModels:
+        def generate_content(self, *, model, contents):
+            captured.update(model=model, contents=contents)
+            return type("Response", (), {"text": "這是一段足夠完整的測試講稿內容。"})()
+
+    class DummyClient:
+        models = DummyModels()
+
+        def close(self):
+            captured["closed"] = True
+
+    def fake_client(*, api_key):
+        captured["api_key"] = api_key
+        return DummyClient()
+
+    monkeypatch.setattr(llm_api.genai, "Client", fake_client)
+
+    result = asyncio.run(llm_api.gemini_chat(
+        text_array=["測試投影片"],
+        script="unused",
+        api_key="AQ.test-key",
+        language="zh",
+        model_name_override="gemini-test",
+    ))
+
+    assert result == ["這是一段足夠完整的測試講稿內容。"]
+    assert captured["api_key"] == "AQ.test-key"
+    assert captured["model"] == "gemini-test"
+    assert "測試投影片" in captured["contents"]
+    assert captured["closed"] is True
+
+
 def test_global_llm_limit_is_shared_by_five_users(monkeypatch):
     _clear_llm_env(monkeypatch)
     monkeypatch.setenv("LLM_PROVIDER", "custom")

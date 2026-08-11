@@ -158,6 +158,39 @@ class ArtifactPipelineTests(unittest.TestCase):
         self.assertGreater(len(synth.call_args.kwargs["reference_audio_bytes"]), 100)
         self.assertTrue(synth.call_args.kwargs["reference_text"])
 
+    def test_chunk_regeneration_resolves_preset_voice_without_uploaded_reference(self):
+        """Preset voices must work for local retries just as normal page TTS does."""
+        first = self.root / "first.wav"
+        second = self.root / "second.wav"
+        replacement = self.root / "replacement.wav"
+        for path in (first, second, replacement):
+            sf.write(path, np.zeros(2400, dtype=np.float32), 24000)
+        source = self.root / "source.wav"
+        combine_tts_chunks([("第一段。", first), ("第二段。", second)], source, silence_ms=120)
+        variant = self.store.record_page_variant_tts(
+            run_id=self.run_id,
+            page_index=0,
+            audio_source_path=source,
+            metadata={"selected_voice_key": "YunJhe_中文-男"},
+        )
+        self.store.update_settings(self.run_id, {"selected_voice_key": "YunJhe_中文-男"})
+
+        with (
+            patch.object(video, "get_video_run_store", return_value=self.store),
+            patch.object(video, "synthesize_tts_preview", return_value=(True, str(replacement), "ok")) as synth,
+        ):
+            response = asyncio.run(video.regenerate_video_run_tts_chunk(
+                run_id=self.run_id,
+                page_index=0,
+                variant_id=variant["variant_id"],
+                chunk_index=1,
+                text="修改後第二段。",
+            ))
+        body = json.loads(bytes(response.body).decode("utf-8"))
+        self.assertTrue(body["ok"])
+        self.assertIn("修改後第二段。", body["page_text"])
+        self.assertGreater(len(synth.call_args.kwargs["reference_audio_bytes"]), 100)
+
     def test_five_batch_jobs_recover_in_fifo_order_and_report_positions(self):
         jobs = []
         run_ids = [self.run_id]

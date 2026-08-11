@@ -306,6 +306,13 @@ export function useRenderQueue({
       if (!res.ok) throw new Error(data?.detail || `局部語音重生失敗 (${res.status})`)
       const nextVariantId = String(data?.variant_id || '')
       if (!nextVariantId) throw new Error('局部語音重生後未取得變體 ID')
+      const alignedScriptText = String(data?.page_text || scriptText).trim()
+      if (alignedScriptText && slides.value[pageIdx]) {
+        // A locally edited chunk changes the spoken source.  Keep the page
+        // script in lockstep before forced alignment; the normal script watch
+        // persists it to the run manifest shortly afterwards.
+        slides.value[pageIdx].scriptText = alignedScriptText
+      }
       const audio = {
         persistent: true,
         ttsId: String(data?.tts_id || nextVariantId),
@@ -315,7 +322,7 @@ export function useRenderQueue({
       const outputMode = subtitleOutputMode?.value || 'burn'
       const aligned = outputMode === 'none'
         ? { segments: [], backend: '', alignId: '', variantId: nextVariantId, warning: '' }
-        : await alignSubtitleForAudio(audio, scriptText, pageIdx)
+        : await alignSubtitleForAudio(audio, alignedScriptText, pageIdx)
       await renderAssVideoFromPrepared(pageIdx, audio, aligned, outputMode)
       await refreshRunManifest({ applySelected: true })
       renderMessage.value = aligned.warning

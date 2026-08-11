@@ -22,7 +22,7 @@ from PIL import Image
 from backend.app.api.video_helpers import is_truthy_env
 from backend.app.services.artifact_store import get_video_run_store
 from backend.app.services.alignment.subtitle_builder import build_srt
-from backend.app.services.video_merge import merge_video_files
+from backend.app.services.video_merge import INSERTED_TRANSITION_STRATEGY, merge_video_files
 
 logger = logging.getLogger("video_abstract")
 router = APIRouter()
@@ -806,6 +806,7 @@ async def merge_selected_video_run_variants(
     source_pages: list[int] = []
     source_variants: dict[str, str] = {}
     source_segment_paths: list[str] = []
+    transition_images: list[str] = []
     missing: list[str] = []
 
     for idx in page_indexes:
@@ -825,6 +826,7 @@ async def merge_selected_video_run_variants(
         source_variants[str(idx)] = variant_id
         variant = next((v for v in (page.get("variants") or []) if v.get("variant_id") == variant_id), {})
         source_segment_paths.append(str((variant.get("paths") or {}).get("segments") or ""))
+        transition_images.append(str((page.get("paths") or {}).get("slide") or ""))
 
     if not input_paths:
         detail = "沒有可合併的已渲染影片"
@@ -832,6 +834,16 @@ async def merge_selected_video_run_variants(
             detail += "：" + "；".join(missing[:5])
         raise HTTPException(status_code=400, detail=detail)
 
+    can_use_inserted_transitions = (
+        bool(transitions_enabled)
+        and len(transition_images) == len(input_paths)
+        and all(path and os.path.isfile(path) for path in transition_images)
+    )
+    expected_transition_strategy = (
+        INSERTED_TRANSITION_STRATEGY
+        if can_use_inserted_transitions
+        else "full-reencode-v1"
+    )
     exports = manifest.setdefault("exports", {})
     for old in exports.get("variants") or []:
         old_settings = old.get("settings") or {}
@@ -840,6 +852,10 @@ async def merge_selected_video_run_variants(
             old.get("source_pages") == source_pages
             and old_settings.get("source_variants") == source_variants
             and bool((old_settings.get("transitions") or {}).get("enabled")) == bool(transitions_enabled)
+            and (
+                not transitions_enabled
+                or (old_settings.get("transitions") or {}).get("strategy") == expected_transition_strategy
+            )
             and old_video
             and os.path.isfile(old_video)
         ):
@@ -870,6 +886,7 @@ async def merge_selected_video_run_variants(
             input_paths,
             merge_temp_dir,
             transitions_enabled=transitions_enabled,
+            transition_images=transition_images if can_use_inserted_transitions else None,
         )
     except (RuntimeError, ValueError) as exc:
         import shutil
@@ -877,7 +894,9 @@ async def merge_selected_video_run_variants(
         raise HTTPException(status_code=500, detail=str(exc))
     merged_segments: list[dict] = []
     offset = 0.0
-    for video_path, segment_path in zip(input_paths, source_segment_paths):
+    inserted_duration = float(transition_metadata.get("duration_seconds") or 0.0)
+    uses_inserted_transitions = transition_metadata.get("strategy") == INSERTED_TRANSITION_STRATEGY
+    for position, (video_path, segment_path) in enumerate(zip(input_paths, source_segment_paths)):
         if segment_path and os.path.isfile(segment_path):
             try:
                 payload = json.loads(open(segment_path, encoding="utf-8").read())
@@ -893,6 +912,8 @@ async def merge_selected_video_run_variants(
             except Exception as exc:
                 logger.warning("Cannot include page SRT in merged export: %s", exc)
         offset += await _media_duration_seconds(video_path)
+        if uses_inserted_transitions and position < len(input_paths) - 1:
+            offset += inserted_duration
     merged_srt = build_srt(merged_segments) if merged_segments else ""
     try:
         variant = store.record_export_variant(

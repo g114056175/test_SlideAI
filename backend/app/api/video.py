@@ -692,6 +692,10 @@ async def video_run_page_tts_endpoint(
             "text": text,
             "voice": voice,
             "speed": speed,
+            # Keep the server-side voice identity with the variant.  This is
+            # also the reliable fallback for a later chunk regeneration when
+            # the browser no longer has the original File object.
+            "selected_voice_key": selected_voice_key or current_settings.get("selected_voice_key") or "",
             "reference_text": reference_text or "",
         },
         label=f"web-page-{page_index + 1}",
@@ -757,11 +761,33 @@ async def regenerate_video_run_tts_chunk(
     current_settings = ((manifest.get("settings") or {}).get("current") or {})
     reference = current_settings.get("reference_audio") or {}
     reference_path = Path(str(reference.get("path") or ""))
-    if not reference_path.is_file():
-        raise HTTPException(status_code=400, detail="此專案沒有可用的參考音檔")
+    reference_bytes: bytes | None = None
+    reference_filename = "reference.wav"
+    preset_transcript = ""
+    if reference_path.is_file():
+        reference_bytes = await asyncio.to_thread(reference_path.read_bytes)
+        reference_filename = str(reference.get("filename") or reference_path.name)
+    else:
+        # Preset voices intentionally do not create a per-project uploaded
+        # reference file.  The ordinary page-TTS route already resolves them
+        # from the trusted server manifest; chunk regeneration must use the
+        # exact same fallback rather than incorrectly requiring an upload.
+        metadata_voice_key = str((tts_data.get("metadata") or {}).get("selected_voice_key") or "")
+        preset = await asyncio.to_thread(
+            _load_preset_reference_voice,
+            metadata_voice_key or current_settings.get("selected_voice_key") or "",
+        )
+        if preset:
+            reference_bytes, reference_filename, preset_transcript = preset
+    if not reference_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="找不到此語音變體的參考音檔或內建音色；請在語音設定重新選擇音色後再重生。",
+        )
     reference_text = str(
         (tts_data.get("metadata") or {}).get("reference_text")
         or current_settings.get("reference_text")
+        or preset_transcript
         or ""
     ).strip()
     if tts_requires_reference_text() and not reference_text:
@@ -770,12 +796,11 @@ async def regenerate_video_run_tts_chunk(
     replacement_text = str(text or chunks[chunk_index].get("text") or "").strip()
     if not replacement_text:
         raise HTTPException(status_code=400, detail="重生文字不可為空")
-    reference_bytes = await asyncio.to_thread(reference_path.read_bytes)
     ok, replacement_path, reason = await asyncio.to_thread(
         synthesize_tts_preview,
         text=replacement_text,
         reference_audio_bytes=reference_bytes,
-        reference_suffix=reference_path.suffix or ".wav",
+        reference_suffix=Path(reference_filename).suffix or ".wav",
         reference_text=reference_text,
     )
     if not ok or not replacement_path or not os.path.isfile(replacement_path):
@@ -815,6 +840,10 @@ async def regenerate_video_run_tts_chunk(
                 {key: value for key, value in chunk.items() if key != "path"}
                 for chunk in ((new_variant.get("tts") or {}).get("chunks") or [])
             ],
+            # If the user edited this local segment, the subsequent full-page
+            # forced alignment must receive the same script as the combined
+            # audio.  Returning it avoids a subtle audio/text timeline drift.
+            "page_text": "\n\n".join(text for text, _ in sources).strip(),
         })
     finally:
         shutil.rmtree(workspace, ignore_errors=True)

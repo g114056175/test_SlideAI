@@ -42,15 +42,21 @@
       <div class="chunk-list">
         <div v-for="chunk in selectedChunks" :key="chunk.index" class="chunk-item">
           <div class="chunk-label">第 {{ Number(chunk.index) + 1 }} 段 · {{ Number(chunk.duration || 0).toFixed(1) }} 秒</div>
-          <div class="chunk-text">{{ chunk.text }}</div>
+          <textarea
+            v-model="chunkDrafts[chunk.index]"
+            class="chunk-text"
+            rows="3"
+            :disabled="chunkRegenerating"
+            :aria-label="`第 ${Number(chunk.index) + 1} 段重生文字`"
+          />
           <button
             type="button"
             class="chunk-retry"
-            :disabled="chunkRegenerating || !String(chunk.text || '').trim()"
+            :disabled="chunkRegenerating || !String(chunkDrafts[chunk.index] || '').trim()"
             @click="$emit('regenerate-chunk', {
               variantId: selectedVariantId,
               chunkIndex: Number(chunk.index),
-              text: String(chunk.text || '').trim(),
+              text: String(chunkDrafts[chunk.index] || '').trim(),
             })"
           >{{ chunkRegenerating ? '處理中…' : '重生此段' }}</button>
         </div>
@@ -60,7 +66,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 const props = defineProps({
   runId: { type: String, default: '' },
@@ -78,6 +84,21 @@ const selectedVariant = computed(() => props.variants.find(
   (variant) => variant.variant_id === props.selectedVariantId,
 ) || null)
 const selectedChunks = computed(() => selectedVariant.value?.tts?.chunks || [])
+const chunkDrafts = ref({})
+
+// Keep edits local until the user explicitly regenerates.  Replacing a
+// variant, switching pages, or finishing a regeneration rebuilds the draft
+// from persisted chunk text so stale edits cannot leak into another variant.
+watch(
+  () => [props.selectedVariantId, props.variants],
+  () => {
+    chunkDrafts.value = Object.fromEntries(selectedChunks.value.map((chunk) => [
+      chunk.index,
+      String(chunk.text || ''),
+    ]))
+  },
+  { immediate: true, deep: true },
+)
 
 const formatVariantTime = (value) => {
   if (!value) return '無時間紀錄'
@@ -164,20 +185,25 @@ const formatVariantTime = (value) => {
   padding-top: 7px;
   color: #bae6fd;
   font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .chunk-repair summary { cursor: pointer; font-weight: 800; }
-.chunk-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; overflow-y: auto; }
-.chunk-item { border: 1px solid #26364d; border-radius: 8px; padding: 6px; background: #0f172a; }
+.chunk-list { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; overflow-y: auto; overflow-x: hidden; min-width: 0; }
+.chunk-item { border: 1px solid #26364d; border-radius: 8px; padding: 6px; background: #0f172a; min-width: 0; overflow: hidden; }
 .chunk-label { color: #94a3b8; margin-bottom: 4px; }
 .chunk-text {
-  max-height: 72px; overflow-y: auto; border: 1px solid #334155;
-  border-radius: 6px; padding: 5px; color: #e2e8f0; background: #020617;
-  font-size: 11px; line-height: 1.45;
+  box-sizing: border-box; display: block; width: 100%; min-width: 0;
+  min-height: 62px; max-height: 88px; resize: none; overflow-y: auto;
+  border: 1px solid #334155; border-radius: 6px; padding: 5px;
+  color: #e2e8f0; background: #020617; font: inherit; font-size: 11px;
+  line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap;
 }
 .chunk-retry {
-  width: 100%; margin-top: 5px; border: 1px solid #0369a1; border-radius: 6px;
-  padding: 5px; color: #e0f2fe; background: #0c4a6e;
+  box-sizing: border-box; display: block; width: 100%; min-width: 0;
+  margin-top: 5px; border: 1px solid #0369a1; border-radius: 6px;
+  padding: 5px; color: #e0f2fe; background: #0c4a6e; overflow: hidden;
 }
 
 .variant-item {
